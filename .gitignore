@@ -1,0 +1,34 @@
+# Environments
+.venv/
+env/
+.env
+.env.*
+venv/
+
+# Reference Materials
+reference_materials/
+"reference material/"
+
+# Documentation
+*.md
+
+# Python Cache & Build
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+build/
+dist/
+*.egg-info/
+.installed.cfg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDEs & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
