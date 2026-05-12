@@ -2,9 +2,11 @@
 src/main.py — Entry Point
 ==========================
 Phase 1: Loads config, sets up structured logging, prints config summary.
+Phase 2: Initializes TLS certificate manager, ensures certs exist.
 Phase 6: Will start the HTTPS proxy server (uvicorn + FastAPI).
 
 Reference: Brainstorming Section 11.1, 11.2 (logging requirements)
+Reference: Brainstorming Section 9.2 (TLS/HTTPS handling)
 """
 
 import logging
@@ -18,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import AppConfig, ConfigError, load_config
+from src.tls.cert_manager import CertManager
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +161,25 @@ def main() -> None:
     log.info("Config loaded successfully.")
     log_config_summary(config)
 
+    # --- Phase 2: TLS Certificate Manager ---
+    log.info("-" * 60)
+    log.info("Initializing TLS certificate manager...")
+    try:
+        cert_manager = CertManager(config.tls)
+        cert_path, key_path = cert_manager.ensure_certs()
+        log.info(f"TLS certificate ready: {cert_path}")
+
+        # Verify SSL context can be created — catches corrupt cert/key early
+        ssl_context = cert_manager.get_ssl_context()
+        log.info("SSL context created successfully")
+    except (RuntimeError, OSError) as e:
+        log.error(f"TLS initialization failed: {e}")
+        log.error("Delete the ag_proxy/ folder and restart to regenerate certificates.")
+        sys.exit(1)
+
     # --- Phase 6 placeholder ---
     log.info("-" * 60)
-    log.info("Phase 1 complete. Server startup is implemented in Phase 6.")
+    log.info("Phase 2 complete. Server startup is implemented in Phase 6.")
     log.info("-" * 60)
 
 

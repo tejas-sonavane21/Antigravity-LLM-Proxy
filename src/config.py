@@ -101,7 +101,7 @@ _TEMPLATE = {
         ]
     },
     "tls": {
-        "cert_dir": "~/.ag_proxy",
+        "cert_dir": "./ag_proxy",
         "cert_file": "proxy-ca.crt",
         "key_file": "proxy-ca.key"
     },
@@ -212,8 +212,13 @@ def _parse_config(raw: dict) -> AppConfig:
     )
 
     tls_raw = raw["tls"]
+    # Resolve cert_dir: expand ~ first, then resolve relative paths
+    # relative paths are anchored to the project root (where main.py is run from)
+    cert_dir_raw = tls_raw["cert_dir"]
+    cert_dir_expanded = os.path.expanduser(cert_dir_raw)
+    cert_dir_resolved = str(Path(cert_dir_expanded).resolve())
     tls = TlsConfig(
-        cert_dir=os.path.expanduser(tls_raw["cert_dir"]),
+        cert_dir=cert_dir_resolved,
         cert_file=tls_raw["cert_file"],
         key_file=tls_raw["key_file"],
     )

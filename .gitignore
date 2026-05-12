@@ -36,6 +36,7 @@ Thumbs.db
 
 # Certificates
 certs/
+ag_proxy/
 
 # Config
 config.json
