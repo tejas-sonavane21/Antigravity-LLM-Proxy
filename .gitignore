@@ -8,6 +8,7 @@ venv/
 # Reference Materials
 reference_materials/
 "reference material/"
+reference_*
 
 # Documentation
 *.md
@@ -32,3 +33,10 @@ pip-delete-this-directory.txt
 .idea/
 .DS_Store
 Thumbs.db
+
+# Certificates
+certs/
+
+# Config
+config.json
+*.json
