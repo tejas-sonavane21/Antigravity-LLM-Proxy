@@ -177,10 +177,43 @@ def main() -> None:
         log.error("Delete the ag_proxy/ folder and restart to regenerate certificates.")
         sys.exit(1)
 
-    # --- Phase 6 placeholder ---
+    # --- Phase 6: Start HTTPS Proxy Server ---
+    # Currently a stub server — logs all requests and returns 200.
+    # Phase 6 will replace this with the real router + provider system.
     log.info("-" * 60)
-    log.info("Phase 2 complete. Server startup is implemented in Phase 6.")
+    log.info("Starting stub HTTPS server...")
+    log.info(f"Listening on https://{config.proxy.host}:{config.proxy.port}")
+    log.info("Press Ctrl+C to stop.")
     log.info("-" * 60)
+
+    try:
+        import uvicorn
+        from fastapi import FastAPI, Request
+        from fastapi.responses import PlainTextResponse
+
+        app = FastAPI()
+
+        @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+        async def catch_all(request: Request, path: str):
+            """Stub: logs the request and returns 200. Phase 6 replaces this."""
+            body_bytes = await request.body()
+            stub_log = logging.getLogger("proxy.stub")
+            stub_log.info(f"{request.method} /{path} ({len(body_bytes)} bytes)")
+            return PlainTextResponse(
+                content=f"[AG Proxy Stub] Received: {request.method} /{path}",
+                status_code=200,
+            )
+
+        uvicorn.run(
+            app,
+            host=config.proxy.host,
+            port=config.proxy.port,
+            ssl_certfile=cert_path,
+            ssl_keyfile=key_path,
+            log_level="warning",  # suppress uvicorn's own access logs (we log our own)
+        )
+    except KeyboardInterrupt:
+        log.info("Proxy stopped by user (Ctrl+C).")
 
 
 if __name__ == "__main__":

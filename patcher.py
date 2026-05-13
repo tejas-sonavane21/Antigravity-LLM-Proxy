@@ -158,32 +158,33 @@ def do_patch(ide_path: str, target_url: str) -> None:
             print(f"  [SKIP]    {relative_path}  (file not found)")
             continue
 
-        # Read original content
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                original_content = f.read()
-        except OSError as e:
-            errors.append(f"{relative_path}: read failed — {e}")
-            print(f"  [ERROR]   {relative_path}  (read failed: {e})")
-            continue
-
-        # --- Backup --- (patch.rs L55-L61)
-        # Only create backup if one doesn't exist. This preserves the truly
-        # original file even across multiple patch/unpatch cycles.
+        # --- Backup FIRST --- (patch.rs L55-L61)
+        # Create byte-perfect backup BEFORE reading content for patching.
+        # Uses shutil.copy2() to preserve exact bytes, permissions, and timestamps.
+        # Only create backup if one doesn't exist — preserves the truly original file.
         backup_path = file_path.with_suffix(".js.bak")
         backup_created = False
         if not backup_path.exists():
             try:
-                with open(backup_path, "w", encoding="utf-8") as f:
-                    f.write(original_content)
+                shutil.copy2(str(file_path), str(backup_path))
                 backup_created = True
             except OSError as e:
                 errors.append(f"{relative_path}: backup failed — {e}")
                 print(f"  [ERROR]   {relative_path}  (backup failed: {e})")
                 continue
 
+        # Read content for patching.
+        # newline="" prevents Python from converting \n <-> \r\n on Windows,
+        # which would corrupt the file (JS files use Unix \n line endings).
+        try:
+            with open(file_path, "r", encoding="utf-8", newline="") as f:
+                original_content = f.read()
+        except OSError as e:
+            errors.append(f"{relative_path}: read failed — {e}")
+            print(f"  [ERROR]   {relative_path}  (read failed: {e})")
+            continue
+
         # --- URL Replacement --- (patch.rs L63-L65)
-        url_matches = URL_PATTERN.findall(original_content)
         url_replace_count = len(URL_PATTERN.findall(original_content))
         new_content = URL_PATTERN.sub(target_url, original_content)
 
@@ -201,7 +202,7 @@ def do_patch(ide_path: str, target_url: str) -> None:
             continue
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
+            with open(file_path, "w", encoding="utf-8", newline="") as f:
                 f.write(new_content)
         except OSError as e:
             errors.append(f"{relative_path}: write failed — {e}")
@@ -309,7 +310,7 @@ def do_status(ide_path: str) -> None:
 
     # Read main.js to determine patch status
     try:
-        with open(main_js, "r", encoding="utf-8") as f:
+        with open(main_js, "r", encoding="utf-8", newline="") as f:
             content = f.read()
     except OSError as e:
         print(f"  [ERROR] Could not read main.js: {e}")

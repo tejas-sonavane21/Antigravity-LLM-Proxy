@@ -13,7 +13,7 @@
     ]
   },
   "tls": {
-    "cert_dir": "~/.ag_proxy",
+    "cert_dir": "./ag_proxy",
     "cert_file": "proxy-ca.crt",
     "key_file": "proxy-ca.key"
   },
@@ -31,6 +31,7 @@
     }
   ],
   "patcher": {
-    "target_url": "https://127.0.0.1:9527"
+    "target_url": "https://127.0.0.1:9527",
+    "ide_path": "D:\\Anti_Gravity\\Antigravity\\resources\\app\\out"
   }
 }
