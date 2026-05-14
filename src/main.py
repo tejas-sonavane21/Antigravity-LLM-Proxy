@@ -177,30 +177,106 @@ def main() -> None:
         log.error("Delete the ag_proxy/ folder and restart to regenerate certificates.")
         sys.exit(1)
 
-    # --- Phase 6: Start HTTPS Proxy Server ---
-    # Currently a stub server — logs all requests and returns 200.
-    # Phase 6 will replace this with the real router + provider system.
+    # --- Phase 4 Step 0: Enhanced Traffic-Capture Stub Server ---
+    # This stub categorises every IDE request, mocks telemetry with empty JSON,
+    # and dumps full headers + decoded body for any non-telemetry requests so we
+    # can discover the exact AI endpoint path and internal model name strings.
+    # Phase 6 replaces this with the real router.
     log.info("-" * 60)
-    log.info("Starting stub HTTPS server...")
+    log.info("Starting enhanced stub HTTPS server (Phase 4 traffic capture)...")
     log.info(f"Listening on https://{config.proxy.host}:{config.proxy.port}")
     log.info("Press Ctrl+C to stop.")
     log.info("-" * 60)
 
     try:
+        import json as _json
         import uvicorn
         from fastapi import FastAPI, Request
-        from fastapi.responses import PlainTextResponse
+        from fastapi.responses import JSONResponse
 
         app = FastAPI()
 
-        @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+        # ---------------------------------------------------------------
+        # Telemetry endpoints — mock with empty JSON (no upstream needed).
+        # Identical behaviour to reference project proxy.rs L1541-L1566.
+        # ---------------------------------------------------------------
+        _TELEMETRY_PATHS = (
+            "cascadeNuxes",
+            "recordCodeAssistMetrics",
+            "recordTrajectoryAnalytics",
+            "fetchAdminControls",
+            "/log",
+        )
+
+        # Auxiliary init endpoints — mock so the IDE doesn't stall.
+        _AUX_PATHS = (
+            "loadCodeAssist",
+            "fetchUserInfo",
+            "fetchAvailableModels",
+        )
+
+        @app.api_route(
+            "/{path:path}",
+            methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
+        )
         async def catch_all(request: Request, path: str):
-            """Stub: logs the request and returns 200. Phase 6 replaces this."""
             body_bytes = await request.body()
+            content_type = request.headers.get("content-type", "")
             stub_log = logging.getLogger("proxy.stub")
-            stub_log.info(f"{request.method} /{path} ({len(body_bytes)} bytes)")
-            return PlainTextResponse(
-                content=f"[AG Proxy Stub] Received: {request.method} /{path}",
+
+            full_path = f"/{path}"
+            if request.url.query:
+                full_path += f"?{request.url.query}"
+
+            # --- Classify ---
+            is_telemetry = any(ep in full_path for ep in _TELEMETRY_PATHS)
+            is_aux = any(ep in full_path for ep in _AUX_PATHS)
+
+            tag = "[TELEM]" if is_telemetry else "[AUX  ]" if is_aux else "[AI?  ]"
+
+            # Always log the one-liner
+            stub_log.info(
+                f"{tag} {request.method} {full_path} | {len(body_bytes)}B | {content_type}"
+            )
+
+            # For non-telemetry: dump headers + body for analysis
+            if not is_telemetry:
+                stub_log.debug(f"  Headers : {dict(request.headers)}")
+
+                if body_bytes:
+                    # Try JSON parse first (readable output)
+                    try:
+                        body_obj = _json.loads(body_bytes)
+                        pretty = _json.dumps(body_obj, indent=2, ensure_ascii=False)
+                        # Cap at 3000 chars to avoid log flood on large requests
+                        stub_log.info(
+                            f"  Body (JSON):\n{pretty[:3000]}"
+                            + (" ...[truncated]" if len(pretty) > 3000 else "")
+                        )
+                    except (_json.JSONDecodeError, UnicodeDecodeError):
+                        # Binary / protobuf — hex dump first 200 bytes
+                        stub_log.info(
+                            f"  Body (binary/proto, first 200B hex):\n  {body_bytes[:200].hex()}"
+                        )
+
+            # --- Mock responses ---
+            if is_telemetry:
+                # Swallow /log with 204; everything else gets empty 200 JSON
+                if full_path.startswith("/log"):
+                    from starlette.responses import Response as _Resp
+                    return _Resp(status_code=204)
+                return JSONResponse(content={}, status_code=200)
+
+            if is_aux:
+                return JSONResponse(content={}, status_code=200)
+
+            # Unknown / AI endpoint — return empty stub JSON (IDE will fail gracefully)
+            stub_log.info(
+                f"  [AI?  ] Returning empty stub JSON. "
+                f"Implement real handler in Phase 6."
+            )
+            return JSONResponse(
+                content={"candidates": [], "modelVersion": "stub"},
                 status_code=200,
             )
 
@@ -210,7 +286,7 @@ def main() -> None:
             port=config.proxy.port,
             ssl_certfile=cert_path,
             ssl_keyfile=key_path,
-            log_level="warning",  # suppress uvicorn's own access logs (we log our own)
+            log_level="warning",  # suppress uvicorn's own access logs
         )
     except KeyboardInterrupt:
         log.info("Proxy stopped by user (Ctrl+C).")
