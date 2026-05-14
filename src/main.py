@@ -177,13 +177,17 @@ def main() -> None:
         log.error("Delete the ag_proxy/ folder and restart to regenerate certificates.")
         sys.exit(1)
 
-    # --- Phase 4 Step 0: Enhanced Traffic-Capture Stub Server ---
-    # This stub categorises every IDE request, mocks telemetry with empty JSON,
-    # and dumps full headers + decoded body for any non-telemetry requests so we
-    # can discover the exact AI endpoint path and internal model name strings.
-    # Phase 6 replaces this with the real router.
+    # --- Phase 5: Provider Registry ---
+    from src.provider.registry import ProviderRegistry
+
     log.info("-" * 60)
-    log.info("Starting enhanced stub HTTPS server (Phase 4 traffic capture)...")
+    log.info("Initializing provider registry...")
+    registry = ProviderRegistry()
+    registry.load_from_config(config.providers)
+
+    # --- Phase 5: Proxy Server (provider routing enabled) ---
+    log.info("-" * 60)
+    log.info("Starting proxy server (Phase 5 — provider routing enabled)...")
     log.info(f"Listening on https://{config.proxy.host}:{config.proxy.port}")
     log.info("Press Ctrl+C to stop.")
     log.info("-" * 60)
@@ -318,11 +322,44 @@ def main() -> None:
                     return _FastResp(status_code=204)
                 return JSONResponse(content={}, status_code=200)
 
-            # --- Everything else: forward to Google verbatim ---
-            # This includes loadCodeAssist, fetchAvailableModels, onboardUser,
-            # fetchUserInfo, and any actual AI chat requests.
-            # The responses are logged above so we can discover model names
-            # and the exact AI endpoint format.
+            # --- Phase 5: Provider routing ---
+            # Try to extract model name from body first, then from URL path.
+            # If a mapping exists → run full provider pipeline.
+            # If no mapping → fall through to Google pass-through.
+            from src.converter.model_extractor import (
+                extract_model_from_body,
+                extract_model_from_path,
+            )
+            from src.provider.openai_compat import OpenAICompatProvider
+
+            model_name = (
+                extract_model_from_body(body_bytes)
+                or extract_model_from_path(full_path)
+            )
+
+            if model_name:
+                match = registry.find_provider_for_model(model_name)
+                if match:
+                    provider, target_model = match
+                    stub_log.info(
+                        f"  [ROUTE] [{model_name}] → "
+                        f"provider [{provider.name}] → [{target_model}]"
+                    )
+                    compat = OpenAICompatProvider(provider)
+                    status, resp_headers, sse_body = await compat.forward_request(
+                        body_bytes,
+                        target_model,
+                        config.proxy.include_thoughts,
+                    )
+                    return _FastResp(
+                        content=sse_body.encode("utf-8"),
+                        status_code=status,
+                        headers=resp_headers,
+                    )
+
+            # --- No match: forward to Google verbatim ---
+            # Covers: loadCodeAssist, fetchAvailableModels, onboardUser,
+            # fetchUserInfo, unmapped AI models, and all other endpoints.
             return await _forward(request, full_path)
 
         uvicorn.run(

@@ -30,6 +30,20 @@ Critical behaviours:
      ──────────────────────────────────────────
      OpenAI returns tool arguments as a JSON string.
      Gemini expects "args" as a parsed object. We parse the string.
+
+  5. Reasoning / thinking field (OpenRouter/OpenCode Zen extension)
+     ─────────────────────────────────────────────────────────────
+     OpenRouter-compatible providers (incl. OpenCode Zen) return a
+     non-standard "reasoning" field alongside "content" when the
+     underlying model supports thinking (e.g. MiniMax, DeepSeek-R1).
+     Claude via OpenRouter uses "thinking_content" instead.
+
+     We map these to Gemini thought parts:
+       {"thought": true, "text": "<reasoning text>"}
+
+     These are prepended BEFORE the content part so the IDE displays
+     them as a collapsible thinking/reasoning preview — identical to
+     how native Gemini and Claude thinking is shown.
 """
 
 import json
@@ -85,7 +99,25 @@ def convert_response(openai_resp: dict, target_model: str) -> str:
         if not finish_reason_raw or finish_reason_raw == "stop":
             finish_reason_raw = choice.get("finish_reason") or "stop"
 
-        # --- Text content -> {"text": "..."} (provider.rs L592-L594) ---
+        # --- Reasoning / thinking → {"thought": true, "text": "..."}  ---
+        # OpenRouter/OpenCode Zen: "reasoning" field (MiniMax, DeepSeek-R1, etc.)
+        # Claude via OpenRouter:   "thinking_content" field
+        # Both map to Gemini thought parts so the IDE shows them as
+        # collapsible thinking previews identical to native Gemini thinking.
+        reasoning_text: str | None = None
+        raw_reasoning = msg.get("reasoning")
+        raw_thinking = msg.get("thinking_content")
+        if isinstance(raw_reasoning, str) and raw_reasoning.strip():
+            reasoning_text = raw_reasoning.strip()
+        elif isinstance(raw_thinking, str) and raw_thinking.strip():
+            reasoning_text = raw_thinking.strip()
+        if reasoning_text:
+            parts.append({"thought": True, "text": reasoning_text})
+            log.debug(
+                f"  Extracted reasoning ({len(reasoning_text)} chars) → thought part"
+            )
+
+        # --- Text content → {"text": "..."} (provider.rs L592-L594) ---
         content = msg.get("content")
         if isinstance(content, str) and content:
             parts.append({"text": content})
