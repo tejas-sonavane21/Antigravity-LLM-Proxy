@@ -70,7 +70,7 @@ class ProviderConfig:
 @dataclass
 class PatcherConfig:
     target_url: str         # e.g. "https://127.0.0.1:9527"
-    ide_path: str = None    # optional override for IDE install location
+    ide_path: str | None = None  # optional override for IDE install location
 
 
 @dataclass
@@ -109,17 +109,17 @@ _TEMPLATE = {
         {
             "name": "opencode-zen",
             "base_url": "https://opencode.ai/zen/v1",
-            "api_key": "YOUR_ZEN_API_KEY_HERE",
+            "api_key": "YOUR_API_KEY_HERE",
             "protocol": "openai",
             "enabled": True,
             "model_map": {
-                "gemini-3.1-pro-low": "deepseek-v4-flash-free",
                 "gpt-oss-120b-medium": "minimax-m2.5-free"
             }
         }
     ],
     "patcher": {
-        "target_url": "https://127.0.0.1:9527"
+        "target_url": "https://127.0.0.1:9527",
+        "ide_path": "C:\\Path\\To\\Antigravity\\resources\\app\\out"
     }
 }
 

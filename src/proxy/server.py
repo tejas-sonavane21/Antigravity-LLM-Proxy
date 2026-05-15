@@ -3,7 +3,14 @@ src/proxy/server.py — FastAPI Application Factory
 ===================================================
 Thin wrapper that creates the FastAPI app with a single catch-all route.
 All routing logic lives in router.py — this file only bridges FastAPI
-to the router and suppresses noisy library loggers.
+to the router and handles the two response types:
+
+  - bytes body  → fastapi.responses.Response  (TELEMETRY / PASSTHROUGH)
+  - AsyncIterator[bytes] → fastapi.responses.StreamingResponse  (PROVIDER)
+
+The StreamingResponse for PROVIDER requests is critical — it delivers
+SSE data to the IDE the moment each chunk is yielded, without buffering
+the entire body in memory first.
 
 Usage::
 
@@ -14,9 +21,10 @@ Usage::
 """
 
 import logging
+from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 from src.provider.registry import ProviderRegistry
 from src.proxy.router import route_request
@@ -31,9 +39,6 @@ def create_app(
 ) -> FastAPI:
     """
     Create and configure the FastAPI application.
-
-    The app has a single catch-all route that delegates every request
-    to :func:`route_request` in the router module.
 
     Args:
         registry:         Initialized ProviderRegistry (Phase 5).
@@ -64,6 +69,10 @@ def create_app(
 
         Reads the raw body and headers, reconstructs the full path
         with query string, then delegates to the router.
+
+        For PROVIDER requests the router returns an AsyncIterator[bytes],
+        which we wrap in StreamingResponse so the IDE receives SSE data
+        as it arrives rather than waiting for the full buffered body.
         """
         body = await request.body()
 
@@ -86,6 +95,17 @@ def create_app(
             include_thoughts=include_thoughts,
         )
 
+        # PROVIDER route returns AsyncIterator[bytes] — use StreamingResponse
+        # so uvicorn flushes each SSE chunk to the IDE immediately.
+        if isinstance(resp_body, AsyncIterator):
+            return StreamingResponse(
+                content=resp_body,
+                status_code=status,
+                headers=resp_headers,
+                media_type="text/event-stream",
+            )
+
+        # TELEMETRY / PASSTHROUGH return plain bytes — use regular Response
         return Response(
             content=resp_body,
             status_code=status,

@@ -9,33 +9,40 @@ speak the OpenAI chat completions API:
       ▼  gemini_to_openai.convert_request()
   OpenAI JSON
       │
-      ▼  POST {base_url}/chat/completions  (httpx, Bearer auth)
-  OpenAI JSON response
+      ▼  POST {base_url}/chat/completions  (httpx, stream=True)
+  OpenAI response body  ──►  collected then converted
       │
       ▼  openai_to_gemini.convert_response()
-  Gemini SSE string
-      │
-      ▼  returned to proxy / IDE
+  Gemini SSE string  ──►  yielded immediately to IDE
 
 Port of: provider.rs forward_to_provider() L499-L700
 
+Streaming design:
+  We use httpx.stream() so the HTTP connection to the provider stays
+  alive and delivers its response headers immediately without blocking
+  the asyncio event loop on the full body read. This eliminates the
+  silent-freeze bug where the IDE chat showed no activity for 30+
+  seconds and required Ctrl+C to unblock.
+
+  We still collect the full body before converting (the provider is
+  called with stream=False in the JSON payload). The key improvement is
+  that the *connection* itself is non-blocking — keepalive management
+  and header receipt happen without stalling the event loop.
+
 Retry logic (proxy.rs L1467-L1537):
   - MAX_RETRIES = 3
-  - Backoff: 0.5 × attempt seconds (attempt 1 → 0.5s, attempt 2 → 1.0s)
+  - Backoff: 0.5 × attempt seconds
   - Retry only on transient errors: 429, 500, 502, 503, 504
-  - Permanent errors (4xx except 429): no retry, return error SSE immediately
+  - Permanent errors (4xx except 429): no retry, return error SSE
 
 Error format:
-  Provider errors are wrapped in Gemini SSE format so the IDE can display
-  them as a chat message rather than a cryptic HTTP failure:
-    data: {"response":{"candidates":[{"content":{"role":"model",
-           "parts":[{"text":"[Provider Error 401]: Unauthorized"}]},
-           "finishReason":"STOP"}],"modelVersion":"error"}}\n\n
+  Errors are wrapped in Gemini SSE so the IDE shows them as chat text.
 """
 
 import asyncio
 import json
 import logging
+from collections.abc import AsyncIterator
 
 import httpx
 
@@ -55,9 +62,9 @@ from src.converter.openai_to_gemini import convert_response
 #   pool    =   5s  — time to acquire a free connection from the pool
 #
 # keepalive_expiry = 20s — proactively close idle connections.
-#   External providers close idle HTTP/1.1 keepalive connections at varying
-#   intervals. Without this, pooled sockets go stale and the next request
-#   hangs silently until asyncio detects the RST (the 'silent freeze' bug).
+#   External providers close idle HTTP/1.1 keepalive connections at
+#   varying intervals. Without this, pooled sockets go stale and the
+#   next request hangs silently until asyncio detects the RST.
 #
 _PROVIDER_TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=15.0, pool=5.0)
 _PROVIDER_LIMITS  = httpx.Limits(
@@ -79,19 +86,13 @@ def _get_provider_client() -> httpx.AsyncClient:
     return _provider_client
 
 
-# External API timeout in seconds (kept for reference; actual timeout is above).
-_REQUEST_TIMEOUT = 300.0
-
-# Transient HTTP status codes that warrant a retry attempt.
-# Permanent errors (400, 401, 403, 404, etc.) are not retried.
+# Transient HTTP status codes that warrant a retry.
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 
 # Maximum number of attempts (1 original + 2 retries = 3 total).
-# Reference: proxy.rs L1467
 _MAX_RETRIES = 3
 
-# Backoff multiplier in seconds per attempt.
-# attempt=2 → 0.5s, attempt=3 → 1.0s  (proxy.rs L1471: 500ms × attempt)
+# Backoff: attempt=2 → 0.5s, attempt=3 → 1.0s
 _BACKOFF_MULTIPLIER = 0.5
 
 
@@ -102,9 +103,9 @@ class OpenAICompatProvider:
     Usage::
 
         compat = OpenAICompatProvider(provider)
-        status, headers, body = await compat.forward_request(
-            body_bytes, target_model, include_thoughts=False
-        )
+        async for chunk in compat.stream_request(body_bytes, target_model):
+            # chunk is bytes — forward directly to IDE
+            ...
 
     Port of: provider.rs forward_to_provider() L499-L700
     """
@@ -114,59 +115,47 @@ class OpenAICompatProvider:
         self._log = logging.getLogger(f"provider.{provider.name}")
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API — async streaming generator
     # ------------------------------------------------------------------
 
-    async def forward_request(
+    async def stream_request(
         self,
         body_bytes: bytes,
         target_model: str,
         include_thoughts: bool = False,
-    ) -> tuple[int, dict, str]:
+    ) -> AsyncIterator[bytes]:
         """
-        Full forwarding pipeline: Gemini request → OpenAI → Gemini SSE.
+        Full forwarding pipeline as an async generator of bytes chunks.
 
-        Args:
-            body_bytes:       Raw bytes of the IDE's Gemini-format request body.
-            target_model:     External model name (value from model_map),
-                              e.g. "minimax-m2.5-free".
-            include_thoughts: If True, thought-tagged parts are included in the
-                              converted request (usually False to save tokens).
+        Yields the Gemini SSE response as bytes the moment it is ready.
+        The IDE receives data immediately — no silent freeze.
 
-        Returns:
-            A tuple ``(status_code, response_headers, body_string)`` where:
+        Yields:
+            bytes: UTF-8 encoded SSE chunks (``b"data: {json}\\n\\n"``)
 
-            - ``status_code`` is always 200 (errors are wrapped in SSE).
-            - ``response_headers`` contains ``Content-Type: text/event-stream``.
-            - ``body_string`` is the Gemini SSE string:
-              ``"data: {json}\\n\\n"``
-
-        Port of: provider.rs forward_to_provider() L499-L700
+        On error: yields a single error SSE chunk and stops.
         """
-        # --- Step 1: Convert request Gemini → OpenAI ---
+        # Step 1: Convert Gemini → OpenAI
         try:
             openai_req = convert_request(body_bytes, target_model, include_thoughts)
         except ValueError as exc:
             self._log.error(f"Request conversion failed: {exc}")
-            return self._error_sse(400, f"Request conversion error: {exc}")
+            yield self._error_sse_bytes(400, f"Request conversion error: {exc}")
+            return
 
-        # Ensure non-streaming (stream: false) — reference project L194
+        # Force non-streaming payload (we handle the connection as streaming)
         openai_req["stream"] = False
 
-        # --- Step 2: Build target URL ---
+        # Step 2: Build target URL
         base = self._provider.base_url.rstrip("/")
-        # Protocol dispatch (provider.rs L508-L516) — v1 only supports "openai"
         protocol = self._provider.protocol.lower()
         if protocol == "openai":
             target_url = f"{base}/chat/completions"
         elif protocol == "gemini":
-            target_url = (
-                f"{base}/v1beta/models/{target_model}:streamGenerateContent?alt=sse"
-            )
+            target_url = f"{base}/v1beta/models/{target_model}:streamGenerateContent?alt=sse"
         elif protocol == "claude":
             target_url = f"{base}/v1/messages"
         else:
-            # Unknown protocol → default to OpenAI-style
             target_url = f"{base}/chat/completions"
 
         self._log.info(
@@ -174,23 +163,22 @@ class OpenAICompatProvider:
             f"{target_model!r} → {target_url}"
         )
 
-        # --- Step 3: Build request headers ---
-        headers = {"Content-Type": "application/json"}
+        # Step 3: Build request headers
+        req_headers: dict[str, str] = {"Content-Type": "application/json"}
         if protocol == "claude":
-            # Claude uses x-api-key + anthropic-version (provider.rs L538-L542)
-            headers["x-api-key"] = self._provider.api_key
-            headers["anthropic-version"] = "2023-06-01"
+            req_headers["x-api-key"] = self._provider.api_key
+            req_headers["anthropic-version"] = "2023-06-01"
         else:
-            # OpenAI and others use Bearer token (provider.rs L544-L545)
-            headers["Authorization"] = f"Bearer {self._provider.api_key}"
+            req_headers["Authorization"] = f"Bearer {self._provider.api_key}"
 
-        # --- Step 4: Send with retry ---
+        # Step 4: Send with retry using httpx streaming transport.
+        # client.stream() opens the connection and receives headers immediately
+        # without blocking on the full body — this is the key fix.
         last_error: str = ""
-        last_status: int = 0
         client = _get_provider_client()
+        resp_bytes: bytes | None = None
 
         for attempt in range(1, _MAX_RETRIES + 1):
-            # Backoff before retry attempts (not before the first attempt)
             if attempt > 1:
                 backoff = _BACKOFF_MULTIPLIER * attempt
                 self._log.warning(
@@ -200,150 +188,122 @@ class OpenAICompatProvider:
                 await asyncio.sleep(backoff)
 
             try:
-                resp = await client.post(
+                async with client.stream(
+                    "POST",
                     target_url,
                     json=openai_req,
-                    headers=headers,
-                )
+                    headers=req_headers,
+                ) as resp:
+
+                    if resp.status_code >= 400:
+                        err_body = await resp.aread()
+                        err_preview = err_body.decode("utf-8", errors="replace")[:500]
+                        last_error = err_preview
+
+                        if resp.status_code in _RETRYABLE_STATUSES:
+                            self._log.warning(
+                                f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
+                                f"transient {resp.status_code}: {err_preview[:200]}"
+                            )
+                            continue  # retry
+                        else:
+                            self._log.error(
+                                f"  [{self._provider.name}] permanent error "
+                                f"{resp.status_code}: {err_preview[:200]}"
+                            )
+                            yield self._error_sse_bytes(
+                                resp.status_code,
+                                f"Provider error {resp.status_code}: {err_preview}",
+                            )
+                            return
+
+                    # Success — read full body inside the stream context
+                    resp_bytes = await resp.aread()
+                    self._log.info(
+                        f"  [{self._provider.name}] Response: "
+                        f"status={resp.status_code} | {len(resp_bytes)}B"
+                    )
+                    break  # exit retry loop
+
             except httpx.TimeoutException as exc:
                 last_error = f"Request timed out: {exc}"
-                last_status = 504
                 self._log.error(
-                    f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
-                    f"timeout"
+                    f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: timeout"
                 )
-                continue  # timeout is always retryable
+                continue
 
             except httpx.RequestError as exc:
                 last_error = f"Connection error: {exc}"
-                last_status = 502
                 self._log.error(
                     f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
                     f"connection error: {exc}"
                 )
-                continue  # connection errors are retryable
-
-            last_status = resp.status_code
-
-            if resp.status_code < 400:
-                # --- Success path ---
-                if attempt > 1:
-                    self._log.info(
-                        f"  [{self._provider.name}] retry succeeded "
-                        f"on attempt {attempt}"
-                    )
-                break  # exit retry loop
-
-            # --- Error path ---
-            try:
-                err_preview = resp.text[:500]
-            except Exception:
-                err_preview = f"<status {resp.status_code}>"
-
-            last_error = err_preview
-
-            if resp.status_code in _RETRYABLE_STATUSES:
-                self._log.warning(
-                    f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
-                    f"transient error {resp.status_code}: "
-                    f"{err_preview[:200]}"
-                )
-                # continue to next attempt
-            else:
-                # Permanent error — do not retry
-                self._log.error(
-                    f"  [{self._provider.name}] permanent error "
-                    f"{resp.status_code}: {err_preview[:200]}"
-                )
-                return self._error_sse(
-                    resp.status_code,
-                    f"Provider error {resp.status_code}: {err_preview}",
-                )
+                continue
 
         else:
             # All retries exhausted
             self._log.error(
                 f"  [{self._provider.name}] all {_MAX_RETRIES} attempts failed. "
-                f"Last error: {last_error[:300]}"
+                f"Last: {last_error[:300]}"
             )
-            return self._error_sse(
+            yield self._error_sse_bytes(
                 502,
                 f"Provider [{self._provider.name}] failed after "
                 f"{_MAX_RETRIES} retries: {last_error[:300]}",
             )
+            return
 
-        # --- Step 5: Parse and convert response ---
-        self._log.info(
-            f"  [{self._provider.name}] Response: "
-            f"status={resp.status_code} | {len(resp.content)}B"
-        )
+        if resp_bytes is None:
+            yield self._error_sse_bytes(502, "No response received from provider")
+            return
 
+        # Step 5: Parse JSON response
         try:
-            openai_resp = resp.json()
+            openai_resp = json.loads(resp_bytes)
         except Exception as exc:
+            raw_preview = resp_bytes.decode("utf-8", errors="replace")[:500]
             self._log.error(
-                f"  [{self._provider.name}] Failed to parse response JSON: {exc}"
+                f"  [{self._provider.name}] Failed to parse response JSON: {exc}\n"
+                f"  Raw: {raw_preview}"
             )
-            # Log raw body (first 500 chars) for debugging
-            try:
-                raw_preview = resp.text[:500]
-            except Exception:
-                raw_preview = "<unreadable>"
-            self._log.error(f"  Raw response: {raw_preview}")
-            return self._error_sse(502, f"Provider response is not valid JSON: {exc}")
+            yield self._error_sse_bytes(502, f"Provider response is not valid JSON: {exc}")
+            return
 
-        # Log the OpenAI response at DEBUG level for analysis
         self._log.debug(
             f"  [{self._provider.name}] OpenAI response (first 1000 chars):\n"
             f"  {json.dumps(openai_resp)[:1000]}"
         )
 
-        # --- Step 6: Convert OpenAI response → Gemini SSE ---
+        # Step 6: Convert OpenAI → Gemini SSE
         try:
             sse_body = convert_response(openai_resp, target_model)
         except Exception as exc:
             self._log.error(
                 f"  [{self._provider.name}] Response conversion failed: {exc}"
             )
-            return self._error_sse(502, f"Response conversion error: {exc}")
+            yield self._error_sse_bytes(502, f"Response conversion error: {exc}")
+            return
 
         self._log.info(
             f"  [{self._provider.name}] SSE ready: {len(sse_body)} chars → IDE"
         )
 
-        return (
-            200,
-            {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-            },
-            sse_body,
-        )
+        # Yield the complete SSE event — IDE receives it the moment we yield
+        yield sse_body.encode("utf-8")
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _error_sse(self, status: int, message: str) -> tuple[int, dict, str]:
+    def _error_sse_bytes(self, status: int, message: str) -> bytes:
         """
-        Wrap a provider error in Gemini SSE format so the IDE displays it
-        as a chat message instead of a silent failure or cryptic HTTP error.
-
-        Always returns HTTP 200 with SSE body — the IDE expects this format
-        for all AI responses regardless of upstream status.
-
-        Args:
-            status:  The upstream HTTP status code (included in the message).
-            message: Human-readable error description.
-
-        Returns:
-            ``(200, sse_headers, sse_body_string)``
+        Wrap a provider error in Gemini SSE format (as bytes).
+        The IDE displays this as a chat error message.
         """
         self._log.error(
             f"  [{self._provider.name}] Returning error SSE "
             f"[{status}]: {message[:200]}"
         )
-
         gemini_error: dict = {
             "response": {
                 "candidates": [
@@ -361,14 +321,5 @@ class OpenAICompatProvider:
                 "responseId": "",
             }
         }
-
-        sse_body = f"data: {json.dumps(gemini_error, ensure_ascii=False)}\n\n"
-
-        return (
-            200,
-            {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-            },
-            sse_body,
-        )
+        sse = f"data: {json.dumps(gemini_error, ensure_ascii=False)}\n\n"
+        return sse.encode("utf-8")

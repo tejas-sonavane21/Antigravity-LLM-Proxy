@@ -191,8 +191,8 @@ def main() -> None:
     log.info("-" * 60)
     log.info("Starting proxy server...")
     log.info(f"Listening on https://{config.proxy.host}:{config.proxy.port}")
-    import asyncio
-    import uvicorn
+    log.info("Press Ctrl+C to stop.")
+    log.info("-" * 60)
 
     app = create_app(
         registry=registry,
@@ -200,55 +200,18 @@ def main() -> None:
         include_thoughts=config.proxy.include_thoughts,
     )
 
-    # Create HTTPS Server configuration
-    https_config = uvicorn.Config(
-        app,
-        host=config.proxy.host,
-        port=config.proxy.port,
-        ssl_certfile=str(cert_path),
-        ssl_keyfile=str(key_path),
-        log_level="warning",
-    )
-    https_server = uvicorn.Server(https_config)
-
-    # Create HTTP Server configuration for the binary bypass
-    # Port is hardcoded to port + 1 for simplicity (e.g. 9528)
-    http_port = config.proxy.port + 1
-    http_config = uvicorn.Config(
-        app,
-        host=config.proxy.host,
-        port=http_port,
-        log_level="warning",
-    )
-    http_server = uvicorn.Server(http_config)
-
-    # Prevent the HTTP server from installing its own SIGINT handler.
-    # With two uvicorn servers in the same asyncio loop both try to re-raise
-    # the signal — producing two ERROR tracebacks on Ctrl+C.
-    # Only the HTTPS server handles signals; when it exits we explicitly
-    # stop the HTTP server via should_exit.
-    http_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
-
-    log.info(f"Listening on http://{config.proxy.host}:{http_port} (Binary HTTP Bypass)")
-    log.info("Press Ctrl+C to stop.")
-    log.info("-" * 60)
-
-    async def run_both() -> None:
-        https_task = asyncio.ensure_future(https_server.serve())
-        http_task  = asyncio.ensure_future(http_server.serve())
-
-        # Wait until the primary (HTTPS) server exits — it handles Ctrl+C.
-        await asyncio.wait({https_task, http_task}, return_when=asyncio.FIRST_COMPLETED)
-
-        # Signal the secondary server to shut down, then wait for it.
-        http_server.should_exit  = True
-        https_server.should_exit = True
-        await asyncio.gather(https_task, http_task, return_exceptions=True)
-
+    import uvicorn
     try:
-        asyncio.run(run_both())
+        uvicorn.run(
+            app,
+            host=config.proxy.host,
+            port=config.proxy.port,
+            ssl_certfile=str(cert_path),
+            ssl_keyfile=str(key_path),
+            log_level="warning",
+        )
     except KeyboardInterrupt:
-        pass  # uvicorn already logged the stop
+        pass
 
     log.info("Proxy stopped.")
 
