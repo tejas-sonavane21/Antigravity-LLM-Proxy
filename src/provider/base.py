@@ -42,4 +42,5 @@ class Provider:
     api_key: str
     protocol: str                              # "openai" | "gemini" | "claude"
     enabled: bool
+    streaming: bool                            # True = SSE stream=True; False = non-streaming fallback
     model_map: dict[str, str] = field(default_factory=dict)

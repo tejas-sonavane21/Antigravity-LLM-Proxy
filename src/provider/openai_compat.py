@@ -1,48 +1,53 @@
 """
 src/provider/openai_compat.py — OpenAI-Compatible Provider
 ===========================================================
-Implements the full request-forwarding pipeline for providers that
-speak the OpenAI chat completions API:
+Full request-forwarding pipeline for OpenAI-compatible providers.
 
-  Gemini JSON (IDE)
-      │
-      ▼  gemini_to_openai.convert_request()
-  OpenAI JSON
-      │
-      ▼  POST {base_url}/chat/completions  (httpx, stream=True)
-  OpenAI response body  ──►  collected then converted
-      │
-      ▼  openai_to_gemini.convert_response()
-  Gemini SSE string  ──►  yielded immediately to IDE
+Supports two provider modes, configured per-provider in config.json:
 
-Port of: provider.rs forward_to_provider() L499-L700
+  streaming: true  (default, recommended)
+  ─────────────────────────────────────────
+  Calls provider with stream=True.  Processes each SSE chunk as it arrives:
+    • text/thought deltas  → yielded immediately → IDE sees tokens as typed
+    • tool call deltas     → accumulated then yielded complete on finish
+    • finish event         → yields STOP + usage metadata
 
-Streaming design:
-  We use httpx.stream() so the HTTP connection to the provider stays
-  alive and delivers its response headers immediately without blocking
-  the asyncio event loop on the full body read. This eliminates the
-  silent-freeze bug where the IDE chat showed no activity for 30+
-  seconds and required Ctrl+C to unblock.
+  streaming: false  (fallback for providers that don't support SSE)
+  ──────────────────────────────────────────────────────────────────
+  Calls provider with stream=False.  Uses httpx.stream() for non-blocking
+  I/O (headers received immediately, body read without stalling the loop),
+  then converts and yields one Gemini SSE event.  Works correctly in multi-
+  step agentic flows — the IDE waits for the connection to close after each
+  turn before sending the next request, so there is no buffering issue.
 
-  We still collect the full body before converting (the provider is
-  called with stream=False in the JSON payload). The key improvement is
-  that the *connection* itself is non-blocking — keepalive management
-  and header receipt happen without stalling the event loop.
+Multi-step agentic flow (tool calls):
+  In a real agentic task the IDE sends many sequential requests:
+    Turn 1: user message  → model returns functionCall  → IDE executes tool
+    Turn 2: tool result   → model returns more text/calls → IDE executes tool
+    ...
+    Turn N: final answer
+  Each turn is an independent HTTP request.  Our proxy handles each turn
+  identically — the agentic complexity lives in the IDE, not the proxy.
+
+  For the streaming path, tool call SSE events are special:
+    - Provider sends tool_call deltas (id, name, args fragments) across
+      multiple chunks.  We accumulate them fully before yielding.
+    - We yield a thought event immediately for each reasoning chunk.
+    - When finish_reason=tool_calls arrives, we yield the complete
+      functionCall event with thoughtSignature injected (required by IDE).
+    - The connection then closes normally → IDE processes the tool.
 
 Retry logic (proxy.rs L1467-L1537):
-  - MAX_RETRIES = 3
-  - Backoff: 0.5 × attempt seconds
-  - Retry only on transient errors: 429, 500, 502, 503, 504
-  - Permanent errors (4xx except 429): no retry, return error SSE
-
-Error format:
-  Errors are wrapped in Gemini SSE so the IDE shows them as chat text.
+  MAX_RETRIES = 3  |  Backoff = 0.5s × attempt
+  Retry on: 429, 500, 502, 503, 504
+  No retry on: 400, 401, 403, 404, etc.
 """
 
 import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 import httpx
 
@@ -52,20 +57,8 @@ from src.converter.openai_to_gemini import convert_response
 
 
 # ---------------------------------------------------------------------------
-# Shared HTTP client for provider requests
+# Shared HTTP client
 # ---------------------------------------------------------------------------
-#
-# Per-phase timeout breakdown:
-#   connect =  15s  — TLS + TCP handshake to external provider
-#   read    = 300s  — AI responses can take minutes; keep generous
-#   write   =  15s  — sending the (potentially large) request body
-#   pool    =   5s  — time to acquire a free connection from the pool
-#
-# keepalive_expiry = 20s — proactively close idle connections.
-#   External providers close idle HTTP/1.1 keepalive connections at
-#   varying intervals. Without this, pooled sockets go stale and the
-#   next request hangs silently until asyncio detects the RST.
-#
 _PROVIDER_TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=15.0, pool=5.0)
 _PROVIDER_LIMITS  = httpx.Limits(
     max_keepalive_connections=5,
@@ -86,28 +79,153 @@ def _get_provider_client() -> httpx.AsyncClient:
     return _provider_client
 
 
-# Transient HTTP status codes that warrant a retry.
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
-
-# Maximum number of attempts (1 original + 2 retries = 3 total).
 _MAX_RETRIES = 3
-
-# Backoff: attempt=2 → 0.5s, attempt=3 → 1.0s
 _BACKOFF_MULTIPLIER = 0.5
 
+# OpenAI finish_reason → Gemini finishReason
+_FINISH_REASON_MAP = {
+    "stop":       "STOP",
+    "tool_calls": "STOP",
+    "length":     "MAX_TOKENS",
+    "max_tokens": "MAX_TOKENS",
+}
+
+
+# ---------------------------------------------------------------------------
+# Delta accumulator for streaming tool calls
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _ToolCallAcc:
+    """Accumulates one tool call's deltas (id, name, args) across SSE chunks."""
+    index:     int
+    call_id:   str = ""
+    name:      str = ""
+    args_json: str = ""   # JSON string, built up fragment by fragment
+
+
+# ---------------------------------------------------------------------------
+# SSE frame builders
+# ---------------------------------------------------------------------------
+
+def _make_sse(gemini_dict: dict) -> bytes:
+    """Serialise a Gemini response dict to ``data: {json}\\n\\n`` bytes."""
+    return f"data: {json.dumps(gemini_dict, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _partial_text_event(text: str, thought: bool = False) -> bytes:
+    """
+    Build a partial Gemini SSE event for one text or thought delta.
+    finishReason is omitted (empty string) to signal 'more coming'.
+    """
+    part: dict = {"text": text}
+    if thought:
+        part["thought"] = True
+    return _make_sse({
+        "response": {
+            "candidates": [{
+                "content": {"role": "model", "parts": [part]},
+                "finishReason": "",
+            }],
+            "modelVersion": "",
+        }
+    })
+
+
+def _tool_call_event(
+    tool_accs: list[_ToolCallAcc],
+    finish_reason: str,
+    model_version: str,
+    usage: dict | None = None,
+) -> bytes:
+    """
+    Build the complete Gemini SSE event for all accumulated tool calls.
+    Includes thoughtSignature on every functionCall — required by the IDE;
+    without it the IDE silently discards the tool call (no error, nothing).
+    """
+    parts = []
+    for tc in tool_accs:
+        try:
+            args_parsed = json.loads(tc.args_json) if tc.args_json.strip() else {}
+        except json.JSONDecodeError:
+            args_parsed = {}
+
+        fc: dict = {
+            "name": tc.name,
+            "args": args_parsed,
+            # CRITICAL: IDE silently drops tool calls without this field
+            # Reference: openai_to_gemini.py + brainstorming_session §11.6.1
+            "thoughtSignature": "skip_thought_signature_validator",
+        }
+        if tc.call_id:
+            fc["id"] = tc.call_id
+
+        parts.append({"functionCall": fc})
+
+    gemini_finish = _FINISH_REASON_MAP.get(finish_reason.lower(), "STOP")
+    resp: dict = {
+        "candidates": [{
+            "content": {"role": "model", "parts": parts},
+            "finishReason": gemini_finish,
+        }],
+        "modelVersion": model_version,
+        "responseId": "",
+    }
+    if usage:
+        resp["usageMetadata"] = {
+            "promptTokenCount":     usage.get("prompt_tokens", 0),
+            "candidatesTokenCount": usage.get("completion_tokens", 0),
+            "totalTokenCount":      usage.get("total_tokens", 0),
+        }
+    return _make_sse({"response": resp})
+
+
+def _finish_event(
+    model_version: str,
+    finish_reason: str,
+    usage: dict | None = None,
+) -> bytes:
+    """
+    Build a terminal Gemini SSE event: empty parts, STOP finishReason, usage.
+    Sent after all text/thought deltas to signal end-of-turn to the IDE.
+    """
+    gemini_finish = _FINISH_REASON_MAP.get(finish_reason.lower(), "STOP")
+    resp: dict = {
+        "candidates": [{
+            "content": {"role": "model", "parts": []},
+            "finishReason": gemini_finish,
+        }],
+        "modelVersion": model_version,
+        "responseId": "",
+    }
+    if usage:
+        resp["usageMetadata"] = {
+            "promptTokenCount":     usage.get("prompt_tokens", 0),
+            "candidatesTokenCount": usage.get("completion_tokens", 0),
+            "totalTokenCount":      usage.get("total_tokens", 0),
+        }
+    return _make_sse({"response": resp})
+
+
+# ---------------------------------------------------------------------------
+# Provider class
+# ---------------------------------------------------------------------------
 
 class OpenAICompatProvider:
     """
-    Handles the complete forward pipeline for OpenAI-compatible providers.
+    Handles the complete Gemini→provider→Gemini pipeline.
+
+    Reads ``provider.streaming`` from the Provider dataclass (set from
+    config.json) to choose between true SSE streaming or non-streaming
+    fallback mode.
 
     Usage::
 
         compat = OpenAICompatProvider(provider)
         async for chunk in compat.stream_request(body_bytes, target_model):
-            # chunk is bytes — forward directly to IDE
+            # chunk: bytes — forwarded to IDE via StreamingResponse
             ...
-
-    Port of: provider.rs forward_to_provider() L499-L700
     """
 
     def __init__(self, provider: Provider) -> None:
@@ -115,7 +233,7 @@ class OpenAICompatProvider:
         self._log = logging.getLogger(f"provider.{provider.name}")
 
     # ------------------------------------------------------------------
-    # Public API — async streaming generator
+    # Public entry point
     # ------------------------------------------------------------------
 
     async def stream_request(
@@ -125,28 +243,46 @@ class OpenAICompatProvider:
         include_thoughts: bool = False,
     ) -> AsyncIterator[bytes]:
         """
-        Full forwarding pipeline as an async generator of bytes chunks.
+        Async generator — yields Gemini SSE bytes for the IDE.
 
-        Yields the Gemini SSE response as bytes the moment it is ready.
-        The IDE receives data immediately — no silent freeze.
-
-        Yields:
-            bytes: UTF-8 encoded SSE chunks (``b"data: {json}\\n\\n"``)
-
-        On error: yields a single error SSE chunk and stops.
+        Branches on ``self._provider.streaming``:
+          True  → _stream_from_provider()  (per-token streaming)
+          False → _collect_from_provider() (full-body then convert)
         """
-        # Step 1: Convert Gemini → OpenAI
+        if self._provider.streaming:
+            async for chunk in self._stream_from_provider(
+                body_bytes, target_model, include_thoughts
+            ):
+                yield chunk
+        else:
+            async for chunk in self._collect_from_provider(
+                body_bytes, target_model, include_thoughts
+            ):
+                yield chunk
+
+    # ------------------------------------------------------------------
+    # Shared: request preparation
+    # ------------------------------------------------------------------
+
+    def _prepare_request(
+        self,
+        body_bytes: bytes,
+        target_model: str,
+        include_thoughts: bool,
+        streaming: bool,
+    ) -> tuple[dict, str, dict[str, str]] | None:
+        """
+        Convert body and build URL + headers.
+        Returns ``(openai_req, target_url, req_headers)`` or None on error
+        (error SSE already yielded by caller).
+        """
         try:
             openai_req = convert_request(body_bytes, target_model, include_thoughts)
         except ValueError as exc:
-            self._log.error(f"Request conversion failed: {exc}")
-            yield self._error_sse_bytes(400, f"Request conversion error: {exc}")
-            return
+            return None  # caller yields error
 
-        # Force non-streaming payload (we handle the connection as streaming)
-        openai_req["stream"] = False
+        openai_req["stream"] = streaming
 
-        # Step 2: Build target URL
         base = self._provider.base_url.rstrip("/")
         protocol = self._provider.protocol.lower()
         if protocol == "openai":
@@ -158,12 +294,6 @@ class OpenAICompatProvider:
         else:
             target_url = f"{base}/chat/completions"
 
-        self._log.info(
-            f"Forwarding [{self._provider.name}] "
-            f"{target_model!r} → {target_url}"
-        )
-
-        # Step 3: Build request headers
         req_headers: dict[str, str] = {"Content-Type": "application/json"}
         if protocol == "claude":
             req_headers["x-api-key"] = self._provider.api_key
@@ -171,110 +301,353 @@ class OpenAICompatProvider:
         else:
             req_headers["Authorization"] = f"Bearer {self._provider.api_key}"
 
-        # Step 4: Send with retry using httpx streaming transport.
-        # client.stream() opens the connection and receives headers immediately
-        # without blocking on the full body — this is the key fix.
-        last_error: str = ""
+        return openai_req, target_url, req_headers
+
+    # ------------------------------------------------------------------
+    # Path A: True streaming (provider.streaming = True)
+    # ------------------------------------------------------------------
+
+    async def _stream_from_provider(
+        self,
+        body_bytes: bytes,
+        target_model: str,
+        include_thoughts: bool,
+    ) -> AsyncIterator[bytes]:
+        """
+        Send stream=True, process each SSE chunk as it arrives.
+
+        Text/thought deltas → yield partial Gemini event immediately.
+        Tool call deltas    → accumulate, yield complete event at finish.
+        Finish event        → yield STOP + usage.
+
+        This ensures the IDE sees content within seconds of the provider
+        starting to generate, rather than waiting for the full response.
+        """
+        try:
+            openai_req = convert_request(body_bytes, target_model, include_thoughts)
+        except ValueError as exc:
+            self._log.error(f"Request conversion failed: {exc}")
+            yield self._error_sse_bytes(400, f"Request conversion error: {exc}")
+            return
+
+        openai_req["stream"] = True
+
+        base = self._provider.base_url.rstrip("/")
+        protocol = self._provider.protocol.lower()
+        target_url = self._build_url(base, protocol, target_model)
+        req_headers = self._build_headers(protocol)
+
+        self._log.info(
+            f"[STREAM] [{self._provider.name}] {target_model!r} → {target_url}"
+        )
+
         client = _get_provider_client()
-        resp_bytes: bytes | None = None
 
         for attempt in range(1, _MAX_RETRIES + 1):
             if attempt > 1:
                 backoff = _BACKOFF_MULTIPLIER * attempt
                 self._log.warning(
-                    f"  Retry {attempt}/{_MAX_RETRIES} "
-                    f"[{self._provider.name}], backoff={backoff:.1f}s"
+                    f"  Retry {attempt}/{_MAX_RETRIES} [{self._provider.name}], "
+                    f"backoff={backoff:.1f}s"
                 )
                 await asyncio.sleep(backoff)
 
             try:
                 async with client.stream(
-                    "POST",
-                    target_url,
-                    json=openai_req,
-                    headers=req_headers,
+                    "POST", target_url,
+                    json=openai_req, headers=req_headers,
                 ) as resp:
 
                     if resp.status_code >= 400:
                         err_body = await resp.aread()
                         err_preview = err_body.decode("utf-8", errors="replace")[:500]
-                        last_error = err_preview
-
                         if resp.status_code in _RETRYABLE_STATUSES:
                             self._log.warning(
-                                f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
-                                f"transient {resp.status_code}: {err_preview[:200]}"
+                                f"  [{self._provider.name}] attempt {attempt}: "
+                                f"transient {resp.status_code}"
                             )
-                            continue  # retry
-                        else:
-                            self._log.error(
-                                f"  [{self._provider.name}] permanent error "
-                                f"{resp.status_code}: {err_preview[:200]}"
-                            )
-                            yield self._error_sse_bytes(
-                                resp.status_code,
-                                f"Provider error {resp.status_code}: {err_preview}",
-                            )
-                            return
+                            continue
+                        self._log.error(
+                            f"  [{self._provider.name}] permanent {resp.status_code}"
+                        )
+                        yield self._error_sse_bytes(
+                            resp.status_code,
+                            f"Provider error {resp.status_code}: {err_preview}",
+                        )
+                        return
 
-                    # Success — read full body inside the stream context
-                    resp_bytes = await resp.aread()
+                    # Process the SSE stream line by line
+                    event_count = 0
+                    async for sse_bytes in self._iter_stream_events(resp, target_model):
+                        event_count += 1
+                        yield sse_bytes
+
                     self._log.info(
-                        f"  [{self._provider.name}] Response: "
-                        f"status={resp.status_code} | {len(resp_bytes)}B"
+                        f"  [{self._provider.name}] stream done: "
+                        f"{event_count} Gemini events → IDE"
                     )
-                    break  # exit retry loop
+                    return  # success
 
             except httpx.TimeoutException as exc:
-                last_error = f"Request timed out: {exc}"
                 self._log.error(
-                    f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: timeout"
+                    f"  [{self._provider.name}] attempt {attempt}: timeout: {exc}"
                 )
+                if attempt == _MAX_RETRIES:
+                    yield self._error_sse_bytes(504, f"Provider timed out: {exc}")
                 continue
 
             except httpx.RequestError as exc:
-                last_error = f"Connection error: {exc}"
                 self._log.error(
-                    f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
+                    f"  [{self._provider.name}] attempt {attempt}: "
                     f"connection error: {exc}"
                 )
+                if attempt == _MAX_RETRIES:
+                    yield self._error_sse_bytes(502, f"Connection error: {exc}")
                 continue
 
         else:
-            # All retries exhausted
-            self._log.error(
-                f"  [{self._provider.name}] all {_MAX_RETRIES} attempts failed. "
-                f"Last: {last_error[:300]}"
-            )
             yield self._error_sse_bytes(
                 502,
-                f"Provider [{self._provider.name}] failed after "
-                f"{_MAX_RETRIES} retries: {last_error[:300]}",
+                f"Provider [{self._provider.name}] failed after {_MAX_RETRIES} retries",
+            )
+
+    async def _iter_stream_events(
+        self,
+        resp: httpx.Response,
+        target_model: str,
+    ) -> AsyncIterator[bytes]:
+        """
+        Read the provider's SSE wire format line by line and yield
+        converted Gemini SSE bytes.
+
+        Invariants maintained:
+          - Text/thought partial events have finishReason=""
+          - Tool call event has finishReason="STOP" (set by _tool_call_event)
+          - Finish event always terminates the generator with a STOP frame
+          - Connection closes as soon as the generator returns
+        """
+        tool_accs: dict[int, _ToolCallAcc] = {}
+        has_tool_calls = False
+        finish_reason = "stop"
+        last_model = target_model
+        last_usage: dict | None = None
+        chunk_num = 0
+
+        async for raw_line in resp.aiter_lines():
+            line = raw_line.strip()
+            if not line or not line.startswith("data: "):
+                continue
+
+            data_str = line[6:].strip()
+            if data_str == "[DONE]":
+                break
+
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                self._log.debug(f"  Non-JSON SSE line: {data_str[:80]}")
+                continue
+
+            chunk_num += 1
+
+            if chunk.get("model"):
+                last_model = chunk["model"]
+            if chunk.get("usage"):
+                last_usage = chunk["usage"]
+
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            finish = choice.get("finish_reason")
+            if finish:
+                finish_reason = finish
+
+            # ── Reasoning / thinking ──────────────────────────────────
+            # OpenRouter / OpenCode Zen: "reasoning" field
+            # Claude via OpenRouter:     "thinking_content" field
+            reasoning_delta = (
+                delta.get("reasoning") or
+                delta.get("thinking_content") or
+                ""
+            )
+            if reasoning_delta:
+                self._log.debug(
+                    f"  chunk#{chunk_num}: thought +{len(reasoning_delta)}ch"
+                )
+                yield _partial_text_event(reasoning_delta, thought=True)
+
+            # ── Text content ──────────────────────────────────────────
+            content_delta = delta.get("content") or ""
+            if content_delta:
+                self._log.debug(
+                    f"  chunk#{chunk_num}: text +{len(content_delta)}ch"
+                )
+                yield _partial_text_event(content_delta, thought=False)
+
+            # ── Tool call deltas — accumulate ─────────────────────────
+            for tc_delta in delta.get("tool_calls", []):
+                idx = tc_delta.get("index", 0)
+                has_tool_calls = True
+                if idx not in tool_accs:
+                    tool_accs[idx] = _ToolCallAcc(index=idx)
+                acc = tool_accs[idx]
+                if tc_delta.get("id"):
+                    acc.call_id = tc_delta["id"]
+                fn = tc_delta.get("function", {})
+                if fn.get("name"):
+                    acc.name += fn["name"]
+                if fn.get("arguments"):
+                    acc.args_json += fn["arguments"]
+
+        # ── End of stream: yield terminal event ───────────────────────
+        if has_tool_calls and tool_accs:
+            # Complete tool call event — the IDE will execute the tool(s)
+            # and send Turn N+1 after receiving this event + connection close
+            tool_list = sorted(tool_accs.values(), key=lambda x: x.index)
+            self._log.info(
+                f"  [{self._provider.name}] Tool calls complete: "
+                f"{[t.name for t in tool_list]} → IDE"
+            )
+            yield _tool_call_event(tool_list, finish_reason, last_model, last_usage)
+        else:
+            # Text turn complete — yield final STOP frame
+            self._log.info(
+                f"  [{self._provider.name}] Text turn complete "
+                f"({chunk_num} chunks) → IDE"
+            )
+            yield _finish_event(last_model, finish_reason, last_usage)
+
+    # ------------------------------------------------------------------
+    # Path B: Non-streaming fallback (provider.streaming = False)
+    # ------------------------------------------------------------------
+
+    async def _collect_from_provider(
+        self,
+        body_bytes: bytes,
+        target_model: str,
+        include_thoughts: bool,
+    ) -> AsyncIterator[bytes]:
+        """
+        Send stream=False, collect full body, convert, yield one SSE event.
+
+        Uses httpx.stream() for non-blocking I/O — we still get headers
+        immediately and the event loop is free while the body arrives.
+        This works correctly for multi-step agentic flows: the IDE waits
+        for the connection to close before sending the next request, so
+        there is no buffering ambiguity.
+        """
+        try:
+            openai_req = convert_request(body_bytes, target_model, include_thoughts)
+        except ValueError as exc:
+            self._log.error(f"Request conversion failed: {exc}")
+            yield self._error_sse_bytes(400, f"Request conversion error: {exc}")
+            return
+
+        openai_req["stream"] = False
+
+        base = self._provider.base_url.rstrip("/")
+        protocol = self._provider.protocol.lower()
+        target_url = self._build_url(base, protocol, target_model)
+        req_headers = self._build_headers(protocol)
+
+        self._log.info(
+            f"[COLLECT] [{self._provider.name}] {target_model!r} → {target_url}"
+        )
+
+        client = _get_provider_client()
+
+        for attempt in range(1, _MAX_RETRIES + 1):
+            if attempt > 1:
+                backoff = _BACKOFF_MULTIPLIER * attempt
+                self._log.warning(
+                    f"  Retry {attempt}/{_MAX_RETRIES} [{self._provider.name}], "
+                    f"backoff={backoff:.1f}s"
+                )
+                await asyncio.sleep(backoff)
+
+            try:
+                # httpx.stream() = non-blocking I/O even for non-streaming payloads
+                async with client.stream(
+                    "POST", target_url,
+                    json=openai_req, headers=req_headers,
+                ) as resp:
+
+                    if resp.status_code >= 400:
+                        err_body = await resp.aread()
+                        err_preview = err_body.decode("utf-8", errors="replace")[:500]
+                        if resp.status_code in _RETRYABLE_STATUSES:
+                            self._log.warning(
+                                f"  [{self._provider.name}] attempt {attempt}: "
+                                f"transient {resp.status_code}"
+                            )
+                            continue
+                        self._log.error(
+                            f"  [{self._provider.name}] permanent {resp.status_code}: "
+                            f"{err_preview[:200]}"
+                        )
+                        yield self._error_sse_bytes(
+                            resp.status_code,
+                            f"Provider error {resp.status_code}: {err_preview}",
+                        )
+                        return
+
+                    resp_bytes = await resp.aread()
+
+                self._log.info(
+                    f"  [{self._provider.name}] Response: "
+                    f"status={resp.status_code} | {len(resp_bytes)}B"
+                )
+                break  # success
+
+            except httpx.TimeoutException as exc:
+                self._log.error(
+                    f"  [{self._provider.name}] attempt {attempt}: timeout: {exc}"
+                )
+                if attempt == _MAX_RETRIES:
+                    yield self._error_sse_bytes(504, f"Provider timed out: {exc}")
+                resp_bytes = None
+                continue
+
+            except httpx.RequestError as exc:
+                self._log.error(
+                    f"  [{self._provider.name}] attempt {attempt}: "
+                    f"connection error: {exc}"
+                )
+                if attempt == _MAX_RETRIES:
+                    yield self._error_sse_bytes(502, f"Connection error: {exc}")
+                resp_bytes = None
+                continue
+
+        else:
+            yield self._error_sse_bytes(
+                502,
+                f"Provider [{self._provider.name}] failed after {_MAX_RETRIES} retries",
             )
             return
 
-        if resp_bytes is None:
+        if not resp_bytes:
             yield self._error_sse_bytes(502, "No response received from provider")
             return
 
-        # Step 5: Parse JSON response
+        # Parse and convert
         try:
             openai_resp = json.loads(resp_bytes)
         except Exception as exc:
             raw_preview = resp_bytes.decode("utf-8", errors="replace")[:500]
             self._log.error(
-                f"  [{self._provider.name}] Failed to parse response JSON: {exc}\n"
-                f"  Raw: {raw_preview}"
+                f"  [{self._provider.name}] JSON parse error: {exc} | raw: {raw_preview}"
             )
-            yield self._error_sse_bytes(502, f"Provider response is not valid JSON: {exc}")
+            yield self._error_sse_bytes(502, f"Provider response not valid JSON: {exc}")
             return
 
         self._log.debug(
-            f"  [{self._provider.name}] OpenAI response (first 1000 chars):\n"
-            f"  {json.dumps(openai_resp)[:1000]}"
+            f"  [{self._provider.name}] OpenAI response: "
+            f"{json.dumps(openai_resp)[:500]}"
         )
 
-        # Step 6: Convert OpenAI → Gemini SSE
         try:
             sse_body = convert_response(openai_resp, target_model)
         except Exception as exc:
@@ -287,39 +660,50 @@ class OpenAICompatProvider:
         self._log.info(
             f"  [{self._provider.name}] SSE ready: {len(sse_body)} chars → IDE"
         )
-
-        # Yield the complete SSE event — IDE receives it the moment we yield
         yield sse_body.encode("utf-8")
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Shared URL / header builders
+    # ------------------------------------------------------------------
+
+    def _build_url(self, base: str, protocol: str, target_model: str) -> str:
+        if protocol == "openai":
+            return f"{base}/chat/completions"
+        if protocol == "gemini":
+            return f"{base}/v1beta/models/{target_model}:streamGenerateContent?alt=sse"
+        if protocol == "claude":
+            return f"{base}/v1/messages"
+        return f"{base}/chat/completions"
+
+    def _build_headers(self, protocol: str) -> dict[str, str]:
+        h: dict[str, str] = {"Content-Type": "application/json"}
+        if protocol == "claude":
+            h["x-api-key"] = self._provider.api_key
+            h["anthropic-version"] = "2023-06-01"
+        else:
+            h["Authorization"] = f"Bearer {self._provider.api_key}"
+        return h
+
+    # ------------------------------------------------------------------
+    # Error helper
     # ------------------------------------------------------------------
 
     def _error_sse_bytes(self, status: int, message: str) -> bytes:
-        """
-        Wrap a provider error in Gemini SSE format (as bytes).
-        The IDE displays this as a chat error message.
-        """
+        """Wrap an error in Gemini SSE format so the IDE shows it as chat text."""
         self._log.error(
-            f"  [{self._provider.name}] Returning error SSE "
-            f"[{status}]: {message[:200]}"
+            f"  [{self._provider.name}] Error SSE [{status}]: {message[:200]}"
         )
         gemini_error: dict = {
             "response": {
-                "candidates": [
-                    {
-                        "content": {
-                            "role": "model",
-                            "parts": [
-                                {"text": f"[Provider Error {status}]: {message[:500]}"}
-                            ],
-                        },
-                        "finishReason": "STOP",
-                    }
-                ],
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": f"[Provider Error {status}]: {message[:500]}"}],
+                    },
+                    "finishReason": "STOP",
+                }],
                 "modelVersion": "error",
                 "responseId": "",
             }
         }
-        sse = f"data: {json.dumps(gemini_error, ensure_ascii=False)}\n\n"
-        return sse.encode("utf-8")
+        return f"data: {json.dumps(gemini_error, ensure_ascii=False)}\n\n".encode("utf-8")

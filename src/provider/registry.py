@@ -73,6 +73,7 @@ class ProviderRegistry:
                 api_key=pc.api_key,
                 protocol=pc.protocol,
                 enabled=pc.enabled,
+                streaming=pc.streaming,
                 model_map=dict(pc.model_map),  # shallow copy — immutable strings
             )
             self._providers.append(provider)
@@ -80,6 +81,7 @@ class ProviderRegistry:
             log.debug(
                 f"  Loaded provider [{status}] {provider.name!r} "
                 f"| protocol={provider.protocol} "
+                f"| streaming={provider.streaming} "
                 f"| {len(provider.model_map)} model mapping(s)"
             )
 

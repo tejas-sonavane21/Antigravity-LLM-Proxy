@@ -64,7 +64,8 @@ class ProviderConfig:
     api_key: str            # user's API key for this provider
     protocol: str           # "openai" (only supported protocol in v1)
     enabled: bool           # if False, this provider is skipped during routing
-    model_map: dict         # { "gemini-2.5-flash": "deepseek-v4-flash-free", ... }
+    streaming: bool         # True = stream=True SSE; False = collect full body
+    model_map: dict         # { "gpt-oss-120b-medium": "minimax-m2.5-free", ... }
 
 
 @dataclass
@@ -112,6 +113,7 @@ _TEMPLATE = {
             "api_key": "YOUR_API_KEY_HERE",
             "protocol": "openai",
             "enabled": True,
+            "streaming": True,
             "model_map": {
                 "gpt-oss-120b-medium": "minimax-m2.5-free"
             }
@@ -184,6 +186,9 @@ def _validate_config(raw: dict) -> None:
             raise ConfigError(f"{prefix}.model_map must be a dict")
         if not isinstance(provider["enabled"], bool):
             raise ConfigError(f"{prefix}.enabled must be a boolean")
+        # streaming is optional (defaults True) — validate type if present
+        if "streaming" in provider and not isinstance(provider["streaming"], bool):
+            raise ConfigError(f"{prefix}.streaming must be a boolean")
 
     # --- patcher ---
     patcher = raw["patcher"]
@@ -231,6 +236,7 @@ def _parse_config(raw: dict) -> AppConfig:
             api_key=p["api_key"],
             protocol=p["protocol"].lower(),
             enabled=p["enabled"],
+            streaming=p.get("streaming", True),   # default True: almost all providers support it
             model_map=p["model_map"],
         ))
 

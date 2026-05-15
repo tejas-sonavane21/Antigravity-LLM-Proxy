@@ -41,3 +41,6 @@ ag_proxy/
 # Config
 config.json
 *.json
+
+# test
+test_streaming_pipeline.py
