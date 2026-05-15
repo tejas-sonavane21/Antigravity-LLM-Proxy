@@ -91,6 +91,17 @@ _FINISH_REASON_MAP = {
     "max_tokens": "MAX_TOKENS",
 }
 
+# ---------------------------------------------------------------------------
+# Heartbeat / keepalive
+# ---------------------------------------------------------------------------
+# SSE spec §9.2: lines beginning with ':' are comments and MUST be ignored.
+# We send these when the provider goes silent (long internal reasoning or
+# tool-call argument generation) to prevent the IDE's HTTP keep-alive timer
+# from closing the connection (manifests as ConnectionResetError 10054 on
+# Windows after ~4 minutes of silence).
+_HEARTBEAT_INTERVAL: float = 25.0   # seconds between keepalive injections
+_SSE_KEEPALIVE: bytes = b": keepalive\n\n"  # SSE comment — ignored by IDE parser
+
 
 # ---------------------------------------------------------------------------
 # Delta accumulator for streaming tool calls
@@ -432,8 +443,48 @@ class OpenAICompatProvider:
         last_model = target_model
         last_usage: dict | None = None
         chunk_num = 0
+        heartbeat_count = 0
 
-        async for raw_line in resp.aiter_lines():
+        import time as _time
+        # Track wall-clock time so we can inject keepalives even when the
+        # provider is ACTIVELY sending tool-call argument chunks.  Without
+        # this, large write_to_file generations (file content = hundreds of
+        # small chunks over several minutes) never yield anything to the IDE,
+        # the IDE's SSE keep-alive fires, it closes the connection, and all
+        # accumulated data is lost — the "15-minute freeze" bug.
+        _last_keepalive_t = _time.monotonic()
+
+        _aiter = resp.aiter_lines().__aiter__()
+        while True:
+            # ── Time-based keepalive (covers BOTH silent and busy providers) ──
+            # Check BEFORE awaiting next line so we catch long accumulation runs.
+            _now = _time.monotonic()
+            if _now - _last_keepalive_t >= _HEARTBEAT_INTERVAL:
+                heartbeat_count += 1
+                self._log.debug(
+                    f"  [{self._provider.name}] keepalive #{heartbeat_count} "
+                    f"(chunk#{chunk_num}, has_tool_calls={has_tool_calls})"
+                )
+                yield _SSE_KEEPALIVE
+                _last_keepalive_t = _time.monotonic()
+
+            try:
+                raw_line = await asyncio.wait_for(
+                    _aiter.__anext__(), timeout=_HEARTBEAT_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                # Provider went silent → keepalive
+                heartbeat_count += 1
+                self._log.debug(
+                    f"  [{self._provider.name}] keepalive #{heartbeat_count} "
+                    f"(provider silent)"
+                )
+                yield _SSE_KEEPALIVE
+                _last_keepalive_t = _time.monotonic()
+                continue
+            except StopAsyncIteration:
+                break
+
             line = raw_line.strip()
             if not line or not line.startswith("data: "):
                 continue
@@ -466,8 +517,6 @@ class OpenAICompatProvider:
                 finish_reason = finish
 
             # ── Reasoning / thinking ──────────────────────────────────
-            # OpenRouter / OpenCode Zen: "reasoning" field
-            # Claude via OpenRouter:     "thinking_content" field
             reasoning_delta = (
                 delta.get("reasoning") or
                 delta.get("thinking_content") or
@@ -478,6 +527,7 @@ class OpenAICompatProvider:
                     f"  chunk#{chunk_num}: thought +{len(reasoning_delta)}ch"
                 )
                 yield _partial_text_event(reasoning_delta, thought=True)
+                _last_keepalive_t = _time.monotonic()  # reset — we just yielded
 
             # ── Text content ──────────────────────────────────────────
             content_delta = delta.get("content") or ""
@@ -486,8 +536,10 @@ class OpenAICompatProvider:
                     f"  chunk#{chunk_num}: text +{len(content_delta)}ch"
                 )
                 yield _partial_text_event(content_delta, thought=False)
+                _last_keepalive_t = _time.monotonic()  # reset — we just yielded
 
-            # ── Tool call deltas — accumulate ─────────────────────────
+            # ── Tool call deltas — accumulate (NO yield to IDE here) ──
+            # We log every 50 chunks so the server terminal shows activity.
             for tc_delta in delta.get("tool_calls", []):
                 idx = tc_delta.get("index", 0)
                 has_tool_calls = True
@@ -502,23 +554,37 @@ class OpenAICompatProvider:
                 if fn.get("arguments"):
                     acc.args_json += fn["arguments"]
 
+            if has_tool_calls and chunk_num % 50 == 0:
+                names = [a.name for a in tool_accs.values() if a.name]
+                args_len = sum(len(a.args_json) for a in tool_accs.values())
+                self._log.debug(
+                    f"  chunk#{chunk_num}: accumulating tool_call "
+                    f"{names} | args={args_len}ch so far"
+                )
+
         # ── End of stream: yield terminal event ───────────────────────
+        if heartbeat_count:
+            self._log.info(
+                f"  [{self._provider.name}] {heartbeat_count} keepalive(s) "
+                f"sent during stream"
+            )
         if has_tool_calls and tool_accs:
-            # Complete tool call event — the IDE will execute the tool(s)
-            # and send Turn N+1 after receiving this event + connection close
             tool_list = sorted(tool_accs.values(), key=lambda x: x.index)
             self._log.info(
                 f"  [{self._provider.name}] Tool calls complete: "
                 f"{[t.name for t in tool_list]} → IDE"
             )
             yield _tool_call_event(tool_list, finish_reason, last_model, last_usage)
+            # Small flush delay: lets uvicorn/IOCP deliver the tool_call
+            # bytes before the connection close signal is sent.
+            await asyncio.sleep(0.15)
         else:
-            # Text turn complete — yield final STOP frame
             self._log.info(
                 f"  [{self._provider.name}] Text turn complete "
                 f"({chunk_num} chunks) → IDE"
             )
             yield _finish_event(last_model, finish_reason, last_usage)
+            await asyncio.sleep(0.05)
 
     # ------------------------------------------------------------------
     # Path B: Non-streaming fallback (provider.streaming = False)
@@ -594,7 +660,39 @@ class OpenAICompatProvider:
                         )
                         return
 
-                    resp_bytes = await resp.aread()
+                    # Keepalive-aware body collection 
+                    # For non-streaming providers the ENTIRE response body
+                    # arrives as one blob only after the provider finishes
+                    # generating (can take 4+ minutes for complex tasks).
+                    # Without keepalives the IDE's HTTP connection times out
+                    # (ConnectionResetError 10054 on Windows).
+                    # We read body in chunks with a per-chunk timeout so we
+                    # can inject SSE comments while waiting.
+                    _body_chunks: list[bytes] = []
+                    _hb = 0
+                    _body_aiter = resp.aiter_bytes(chunk_size=65536).__aiter__()
+                    while True:
+                        try:
+                            _chunk = await asyncio.wait_for(
+                                _body_aiter.__anext__(),
+                                timeout=_HEARTBEAT_INTERVAL,
+                            )
+                            _body_chunks.append(_chunk)
+                        except asyncio.TimeoutError:
+                            _hb += 1
+                            self._log.debug(
+                                f"  [{self._provider.name}] collect keepalive "
+                                f"#{_hb} (provider still generating...)"
+                            )
+                            yield _SSE_KEEPALIVE
+                        except StopAsyncIteration:
+                            break
+                    resp_bytes = b"".join(_body_chunks)
+                    if _hb:
+                        self._log.info(
+                            f"  [{self._provider.name}] {_hb} keepalive(s) sent "
+                            f"while collecting {len(resp_bytes)}B response"
+                        )
 
                 self._log.info(
                     f"  [{self._provider.name}] Response: "
