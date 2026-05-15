@@ -446,121 +446,160 @@ class OpenAICompatProvider:
         heartbeat_count = 0
 
         import time as _time
-        # Track wall-clock time so we can inject keepalives even when the
-        # provider is ACTIVELY sending tool-call argument chunks.  Without
-        # this, large write_to_file generations (file content = hundreds of
-        # small chunks over several minutes) never yield anything to the IDE,
-        # the IDE's SSE keep-alive fires, it closes the connection, and all
-        # accumulated data is lost — the "15-minute freeze" bug.
         _last_keepalive_t = _time.monotonic()
 
-        _aiter = resp.aiter_lines().__aiter__()
-        while True:
-            # ── Time-based keepalive (covers BOTH silent and busy providers) ──
-            # Check BEFORE awaiting next line so we catch long accumulation runs.
-            _now = _time.monotonic()
-            if _now - _last_keepalive_t >= _HEARTBEAT_INTERVAL:
-                heartbeat_count += 1
-                self._log.debug(
-                    f"  [{self._provider.name}] keepalive #{heartbeat_count} "
-                    f"(chunk#{chunk_num}, has_tool_calls={has_tool_calls})"
-                )
-                yield _SSE_KEEPALIVE
-                _last_keepalive_t = _time.monotonic()
+        # ── Queue + background Task reader ────────────────────────────────
+        # WHY NOT asyncio.wait_for(_aiter.__anext__(), timeout=25)?
+        #
+        # wait_for cancels the underlying __anext__() coroutine on timeout.
+        # For httpx's aiter_lines(), cancelling __anext__() corrupts the
+        # internal read state permanently.  Every subsequent call then hangs
+        # indefinitely instead of timing out — this is exactly the "1 keepalive
+        # then 6-minute silence" pattern seen in the logs.
+        #
+        # SOLUTION: Run a dedicated asyncio.Task that reads from aiter_lines()
+        # and puts lines into a Queue.  The main loop does
+        # asyncio.wait_for(queue.get(), timeout=25), which is safe to cancel
+        # because Queue.get() is a simple asyncio primitive with no shared
+        # internal state.  The reader task continues uninterrupted.
+        _DONE = object()  # sentinel signalling stream end
+        _queue: asyncio.Queue = asyncio.Queue(maxsize=0)  # unlimited
 
+        async def _line_producer() -> None:
             try:
-                raw_line = await asyncio.wait_for(
-                    _aiter.__anext__(), timeout=_HEARTBEAT_INTERVAL
+                async for raw_line in resp.aiter_lines():
+                    await _queue.put(raw_line)
+            except asyncio.CancelledError:
+                pass  # generator closed before stream ended — clean exit
+            except Exception as exc:
+                self._log.error(
+                    f"  [{self._provider.name}] stream reader error: {exc}"
                 )
-            except asyncio.TimeoutError:
-                # Provider went silent → keepalive
-                heartbeat_count += 1
-                self._log.debug(
-                    f"  [{self._provider.name}] keepalive #{heartbeat_count} "
-                    f"(provider silent)"
+            finally:
+                # Always signal completion so the consumer loop can exit.
+                # put_nowait avoids another await that could be cancelled.
+                try:
+                    _queue.put_nowait(_DONE)
+                except Exception:
+                    pass
+
+        _reader_task = asyncio.create_task(_line_producer())
+
+        try:
+            while True:
+                # ── Time-based keepalive ──────────────────────────────────
+                # Fires every _HEARTBEAT_INTERVAL regardless of whether the
+                # provider is silent or busy streaming tool-call chunks.
+                _now = _time.monotonic()
+                if _now - _last_keepalive_t >= _HEARTBEAT_INTERVAL:
+                    heartbeat_count += 1
+                    self._log.debug(
+                        f"  [{self._provider.name}] keepalive #{heartbeat_count} "
+                        f"(chunk#{chunk_num}, has_tool_calls={has_tool_calls})"
+                    )
+                    yield _SSE_KEEPALIVE
+                    _last_keepalive_t = _time.monotonic()
+
+                # ── Wait for next line (safe to cancel) ──────────────────
+                try:
+                    raw_line = await asyncio.wait_for(
+                        _queue.get(), timeout=_HEARTBEAT_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    heartbeat_count += 1
+                    self._log.debug(
+                        f"  [{self._provider.name}] keepalive #{heartbeat_count} "
+                        f"(provider silent)"
+                    )
+                    yield _SSE_KEEPALIVE
+                    _last_keepalive_t = _time.monotonic()
+                    continue
+
+                if raw_line is _DONE:
+                    break
+
+                line = raw_line.strip()
+                if not line or not line.startswith("data: "):
+                    continue
+
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    self._log.debug(f"  Non-JSON SSE line: {data_str[:80]}")
+                    continue
+
+                chunk_num += 1
+
+                if chunk.get("model"):
+                    last_model = chunk["model"]
+                if chunk.get("usage"):
+                    last_usage = chunk["usage"]
+
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+
+                choice = choices[0]
+                delta = choice.get("delta", {})
+                finish = choice.get("finish_reason")
+                if finish:
+                    finish_reason = finish
+
+                # ── Reasoning / thinking ──────────────────────────────
+                reasoning_delta = (
+                    delta.get("reasoning") or
+                    delta.get("thinking_content") or
+                    ""
                 )
-                yield _SSE_KEEPALIVE
-                _last_keepalive_t = _time.monotonic()
-                continue
-            except StopAsyncIteration:
-                break
+                if reasoning_delta:
+                    self._log.debug(
+                        f"  chunk#{chunk_num}: thought +{len(reasoning_delta)}ch"
+                    )
+                    yield _partial_text_event(reasoning_delta, thought=True)
+                    _last_keepalive_t = _time.monotonic()  # reset — just yielded
 
-            line = raw_line.strip()
-            if not line or not line.startswith("data: "):
-                continue
+                # ── Text content ──────────────────────────────────────
+                content_delta = delta.get("content") or ""
+                if content_delta:
+                    self._log.debug(
+                        f"  chunk#{chunk_num}: text +{len(content_delta)}ch"
+                    )
+                    yield _partial_text_event(content_delta, thought=False)
+                    _last_keepalive_t = _time.monotonic()  # reset — just yielded
 
-            data_str = line[6:].strip()
-            if data_str == "[DONE]":
-                break
+                # ── Tool call deltas — accumulate ─────────────────────
+                for tc_delta in delta.get("tool_calls", []):
+                    idx = tc_delta.get("index", 0)
+                    has_tool_calls = True
+                    if idx not in tool_accs:
+                        tool_accs[idx] = _ToolCallAcc(index=idx)
+                    acc = tool_accs[idx]
+                    if tc_delta.get("id"):
+                        acc.call_id = tc_delta["id"]
+                    fn = tc_delta.get("function", {})
+                    if fn.get("name"):
+                        acc.name += fn["name"]
+                    if fn.get("arguments"):
+                        acc.args_json += fn["arguments"]
 
-            try:
-                chunk = json.loads(data_str)
-            except json.JSONDecodeError:
-                self._log.debug(f"  Non-JSON SSE line: {data_str[:80]}")
-                continue
+                if has_tool_calls and chunk_num % 50 == 0:
+                    names = [a.name for a in tool_accs.values() if a.name]
+                    args_len = sum(len(a.args_json) for a in tool_accs.values())
+                    self._log.debug(
+                        f"  chunk#{chunk_num}: accumulating tool_call "
+                        f"{names} | args={args_len}ch so far"
+                    )
 
-            chunk_num += 1
-
-            if chunk.get("model"):
-                last_model = chunk["model"]
-            if chunk.get("usage"):
-                last_usage = chunk["usage"]
-
-            choices = chunk.get("choices", [])
-            if not choices:
-                continue
-
-            choice = choices[0]
-            delta = choice.get("delta", {})
-            finish = choice.get("finish_reason")
-            if finish:
-                finish_reason = finish
-
-            # ── Reasoning / thinking ──────────────────────────────────
-            reasoning_delta = (
-                delta.get("reasoning") or
-                delta.get("thinking_content") or
-                ""
-            )
-            if reasoning_delta:
-                self._log.debug(
-                    f"  chunk#{chunk_num}: thought +{len(reasoning_delta)}ch"
-                )
-                yield _partial_text_event(reasoning_delta, thought=True)
-                _last_keepalive_t = _time.monotonic()  # reset — we just yielded
-
-            # ── Text content ──────────────────────────────────────────
-            content_delta = delta.get("content") or ""
-            if content_delta:
-                self._log.debug(
-                    f"  chunk#{chunk_num}: text +{len(content_delta)}ch"
-                )
-                yield _partial_text_event(content_delta, thought=False)
-                _last_keepalive_t = _time.monotonic()  # reset — we just yielded
-
-            # ── Tool call deltas — accumulate (NO yield to IDE here) ──
-            # We log every 50 chunks so the server terminal shows activity.
-            for tc_delta in delta.get("tool_calls", []):
-                idx = tc_delta.get("index", 0)
-                has_tool_calls = True
-                if idx not in tool_accs:
-                    tool_accs[idx] = _ToolCallAcc(index=idx)
-                acc = tool_accs[idx]
-                if tc_delta.get("id"):
-                    acc.call_id = tc_delta["id"]
-                fn = tc_delta.get("function", {})
-                if fn.get("name"):
-                    acc.name += fn["name"]
-                if fn.get("arguments"):
-                    acc.args_json += fn["arguments"]
-
-            if has_tool_calls and chunk_num % 50 == 0:
-                names = [a.name for a in tool_accs.values() if a.name]
-                args_len = sum(len(a.args_json) for a in tool_accs.values())
-                self._log.debug(
-                    f"  chunk#{chunk_num}: accumulating tool_call "
-                    f"{names} | args={args_len}ch so far"
-                )
+        finally:
+            # Cancel the reader task when the generator exits (normally or
+            # via GeneratorExit / CancelledError).  Never await here — the
+            # generator may be closing in a context where await is invalid.
+            if not _reader_task.done():
+                _reader_task.cancel()
 
         # ── End of stream: yield terminal event ───────────────────────
         if heartbeat_count:
@@ -575,8 +614,8 @@ class OpenAICompatProvider:
                 f"{[t.name for t in tool_list]} → IDE"
             )
             yield _tool_call_event(tool_list, finish_reason, last_model, last_usage)
-            # Small flush delay: lets uvicorn/IOCP deliver the tool_call
-            # bytes before the connection close signal is sent.
+            # Give the IOCP transport one event-loop cycle to flush the
+            # tool_call bytes before uvicorn sends the connection-close signal.
             await asyncio.sleep(0.15)
         else:
             self._log.info(
