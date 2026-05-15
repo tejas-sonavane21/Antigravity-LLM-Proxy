@@ -10,9 +10,6 @@ Usage:
     python patcher.py status    — Show current patch state
     python patcher.py           — Show this help
 
-This script is STANDALONE — it uses only Python built-ins (json, re, sys,
-shutil, pathlib). No imports from src/, no pip packages required.
-
 Design ported from reference project:
     patch.rs apply_patch()       → do_patch()    [L23-L107]
     patch.rs remove_patch()      → do_unpatch()  [L110-L130]
@@ -22,7 +19,19 @@ Design ported from reference project:
 URL Analysis (verified against actual installed IDE):
     Only main.js contains the 3 hardcoded cloudcode URLs.
     The other 3 files resolve URLs via IPC — they only need TLS injection.
-    See Phase 3 implementation plan for full analysis.
+
+Binary TLS Trust (language_server_windows_x64.exe):
+    The language server binary is a Go executable. It verifies outgoing
+    HTTPS connections using the Windows system cert store (CryptoAPI) by
+    default, OR via SSL_CERT_FILE env var (Go 1.19+).
+
+    We inject process.env.SSL_CERT_FILE into main.js pointing to a
+    combined CA bundle (certifi standard CAs + our proxy CA). The binary
+    inherits this env var via child_process.spawn and trusts our proxy cert.
+
+    NOTE: cert.pem at dist/languageServer/cert.pem is the binary's LOCAL
+    SERVER certificate (for its gRPC server), NOT a CA trust bundle.
+    Modifying that file has no effect on outgoing TLS verification.
 """
 
 import json
@@ -36,7 +45,7 @@ from pathlib import Path
 # Constants
 # ---------------------------------------------------------------------------
 
-# 4 target files — exact list from patch.rs L7-L19
+# 4 target JS files — exact list from patch.rs L7-L19
 # Order matches reference project (extensionHost files first, then main, then cli)
 TARGET_FILES = [
     "main.js",
@@ -45,14 +54,18 @@ TARGET_FILES = [
     "vs/code/node/cliProcessMain.js",
 ]
 
-# TLS bypass injection string — from constants.rs L26
-# Injected at the very start of each JS file.
+# TLS bypass injection — from constants.rs L26.
+# Injected at the very start of each JS file (Node.js processes).
 TLS_INJECT = "process.env.NODE_TLS_REJECT_UNAUTHORIZED='0';"
 
+# SSL_CERT_FILE injection — makes the language server Go binary trust our proxy CA.
+# Go 1.19+ respects SSL_CERT_FILE on Windows. The binary inherits env from
+# the Electron main process via child_process.spawn.
+# Value is machine-specific (absolute path) — computed at patch time.
+# Marker is constant so we can detect/remove it on unpatch.
+SSL_CERT_MARKER = "process.env.SSL_CERT_FILE="
+
 # URL matching regex — ported from patch.rs L35
-# Matches ALL cloudcode googleapis URLs AND previously-patched 127.0.0.1 URLs.
-# The 127.0.0.1:\d+ branch enables idempotent re-patching with a different port.
-# Deliberately does NOT match OAuth, telemetry, feedback, or other googleapis URLs.
 URL_PATTERN = re.compile(
     r"https://([a-zA-Z0-9.\-]*cloudcode[a-zA-Z0-9.\-]*\.googleapis\.com"
     r"|127\.0\.0\.1:\d+)"
@@ -60,6 +73,13 @@ URL_PATTERN = re.compile(
 
 # Regex for reading the current patched target from status check
 PATCHED_URL_PATTERN = re.compile(r"https?://127\.0\.0\.1:(\d+)")
+
+# Path to our proxy CA cert, relative to this script.
+PROXY_CA_RELATIVE = Path("ag_proxy") / "proxy-ca.crt"
+
+# Combined CA bundle path (certifi standard CAs + our proxy CA).
+# Created at patch time. Pointed to by SSL_CERT_FILE env var.
+COMBINED_CA_RELATIVE = Path("ag_proxy") / "combined-ca.pem"
 
 
 # ---------------------------------------------------------------------------
@@ -127,16 +147,96 @@ def load_patcher_config() -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Combined CA Bundle + SSL_CERT_FILE injection
+# ---------------------------------------------------------------------------
+
+def build_combined_ca(proxy_ca_path: Path, combined_path: Path) -> bool:
+    """
+    Create ag_proxy/combined-ca.pem = certifi standard CAs + our proxy CA.
+
+    The language server Go binary uses SSL_CERT_FILE env var (Go 1.19+).
+    SSL_CERT_FILE REPLACES the system cert pool, so we must include the
+    standard CAs (for Google) plus our proxy CA (for our proxy).
+
+    Uses certifi (bundled with httpx in our venv) for the standard CA bundle.
+    Falls back to a minimal-but-correct bundle if certifi is unavailable.
+
+    Returns True on success, False on failure.
+    """
+    if not proxy_ca_path.exists():
+        print(f"  [SKIP] proxy CA not found at: {proxy_ca_path}")
+        print(f"         Run 'python src/main.py' first to generate TLS certs.")
+        return False
+
+    # Find certifi CA bundle
+    certifi_bundle: str | None = None
+    try:
+        import certifi  # type: ignore
+        certifi_bundle = certifi.where()
+    except ImportError:
+        pass
+
+    # Read standard CA bundle
+    standard_cas = ""
+    if certifi_bundle and Path(certifi_bundle).exists():
+        try:
+            with open(certifi_bundle, "r", encoding="utf-8") as f:
+                standard_cas = f.read()
+        except OSError as e:
+            print(f"  [WARN] Could not read certifi bundle: {e}")
+    else:
+        print(f"  [WARN] certifi not found — combined bundle will only contain proxy CA.")
+        print(f"         Install certifi: pip install certifi")
+
+    # Read our proxy CA
+    try:
+        with open(proxy_ca_path, "r", encoding="utf-8") as f:
+            proxy_ca = f.read().strip()
+    except OSError as e:
+        print(f"  [ERROR] proxy CA read failed: {e}")
+        return False
+
+    # Write combined bundle
+    marker = "# Antigravity Proxy CA — injected by patcher.py"
+    combined = f"{standard_cas.rstrip()}\n\n{marker}\n{proxy_ca}\n"
+    try:
+        combined_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(combined_path, "w", encoding="utf-8") as f:
+            f.write(combined)
+    except OSError as e:
+        print(f"  [ERROR] combined-ca.pem write failed: {e}")
+        return False
+
+    ca_count = standard_cas.count("-----BEGIN CERTIFICATE-----")
+    print(f"  [OK] combined-ca.pem created ({ca_count} standard CAs + proxy CA)")
+    return True
+
+
+def make_cert_inject(combined_ca_path: Path) -> str:
+    """
+    Build the SSL_CERT_FILE injection line for a JS file.
+    Uses forward slashes for the path (safe for JS string literals on Windows).
+    """
+    # Forward slashes work fine in Node.js / Go on Windows
+    path_fwd = str(combined_ca_path).replace("\\", "/")
+    return f"process.env.SSL_CERT_FILE='{path_fwd}';"
+
+
+
+
+
+# ---------------------------------------------------------------------------
 # Patch
 # ---------------------------------------------------------------------------
 
 def do_patch(ide_path: str, target_url: str) -> None:
     """
     Apply patch to all TARGET_FILES:
-    1. Create .js.bak backup (only if no backup exists yet)
-    2. Replace cloudcode URLs → target_url using URL_PATTERN regex
-    3. Inject TLS bypass at start of file (if not already present)
-    4. Write patched content only if it changed
+    1. Build combined CA bundle (certifi + proxy CA) for SSL_CERT_FILE
+    2. Create .js.bak backup (only if no backup exists yet)
+    3. Replace cloudcode URLs → target_url using URL_PATTERN regex
+    4. Inject TLS + SSL_CERT_FILE at start of file
+    5. Write patched content only if it changed
 
     Ported from patch.rs apply_patch() L23-L107.
     """
@@ -147,6 +247,16 @@ def do_patch(ide_path: str, target_url: str) -> None:
 
     print(f"\n[PATCH] Target URL : {target_url}")
     print(f"[PATCH] IDE path   : {ide_path}")
+    print()
+
+    # --- Build combined CA bundle FIRST ---
+    print("[PATCH] Building combined CA bundle for language server binary...")
+    proxy_ca_path = (Path(__file__).parent / PROXY_CA_RELATIVE).resolve()
+    combined_ca_path = (Path(__file__).parent / COMBINED_CA_RELATIVE).resolve()
+    ca_ok = build_combined_ca(proxy_ca_path, combined_ca_path)
+    if not ca_ok:
+        print("  [WARN] Continuing without SSL_CERT_FILE injection.")
+        print("         Binary TLS trust will rely on Windows cert store.")
     print()
 
     for relative_path in TARGET_FILES:
@@ -188,15 +298,29 @@ def do_patch(ide_path: str, target_url: str) -> None:
         url_replace_count = len(URL_PATTERN.findall(original_content))
         new_content = URL_PATTERN.sub(target_url, original_content)
 
-        # --- TLS Injection --- (patch.rs L67-L70)
+        # --- TLS + SSL_CERT_FILE Injection ---
         tls_injected = False
+        cert_injected = False
+
         if TLS_INJECT not in new_content:
             new_content = TLS_INJECT + new_content
             tls_injected = True
 
+        # SSL_CERT_FILE injection: Go binary trusts proxy cert via env var.
+        # Idempotent: strip old SSL_CERT_FILE line first, then re-inject.
+        if ca_ok:
+            lines = new_content.splitlines(keepends=True)
+            lines_no_cert = [l for l in lines if not l.startswith(SSL_CERT_MARKER)]
+            if lines_no_cert != lines:
+                new_content = "".join(lines_no_cert)
+
+            cert_inject_line = make_cert_inject(combined_ca_path)
+            if cert_inject_line not in new_content:
+                new_content = cert_inject_line + new_content
+                cert_injected = True
+
         # --- Write only if changed --- (patch.rs L72-L83)
         if new_content == original_content:
-            # File is already correctly patched
             skipped_count += 1
             print(f"  [ALREADY] {relative_path}  (no changes needed)")
             continue
@@ -214,30 +338,28 @@ def do_patch(ide_path: str, target_url: str) -> None:
 
         patched_count += 1
 
-        # Build status description for log
         parts = []
         if url_replace_count > 0:
             parts.append(f"{url_replace_count} URL replacement{'s' if url_replace_count > 1 else ''}")
         else:
             parts.append("0 URL replacements")
-        if tls_injected:
-            parts.append("TLS injected")
-        else:
-            parts.append("TLS already present")
+        parts.append("TLS injected" if tls_injected else "TLS present")
+        parts.append("SSL_CERT_FILE injected" if cert_injected else "SSL_CERT_FILE present")
         bak_note = " [new backup]" if backup_created else " [backup existed]"
 
         print(f"  [PATCHED] {relative_path}  ({', '.join(parts)}){bak_note}")
 
     # --- Summary ---
     print()
-    total = len(TARGET_FILES)
     if errors:
         print(f"[PATCH] Completed with errors: {patched_count} patched, "
               f"{skipped_count} already patched, {len(errors)} failed")
     elif patched_count == 0 and skipped_count > 0:
-        print(f"[PATCH] All files are already patched — nothing to do.")
+        print(f"[PATCH] All JS files are already patched.")
     else:
-        print(f"[PATCH] Done: {patched_count} patched, {skipped_count} already patched")
+        print(f"[PATCH] JS done: {patched_count} patched, {skipped_count} already patched")
+    print()
+    print("[PATCH] All done.")
 
 
 # ---------------------------------------------------------------------------
@@ -283,12 +405,23 @@ def do_unpatch(ide_path: str) -> None:
     # --- Summary ---
     print()
     if restored_count == 0:
-        print("[UNPATCH] No backup files found — nothing to restore.")
+        print("[UNPATCH] No JS backup files found — nothing to restore.")
         print("          (If you patched manually, backups may have been renamed.)")
     else:
-        print(f"[UNPATCH] Done: {restored_count} file(s) restored.")
+        print(f"[UNPATCH] JS done: {restored_count} file(s) restored.")
         if missing_count > 0:
-            print(f"          {missing_count} file(s) had no backup (may not have been patched).")
+            print(f"          {missing_count} file(s) had no backup.")
+
+    # --- Delete combined CA bundle ---
+    combined_ca_path = (Path(__file__).parent / COMBINED_CA_RELATIVE).resolve()
+    if combined_ca_path.exists():
+        try:
+            combined_ca_path.unlink()
+            print(f"  [REMOVED] combined-ca.pem")
+        except OSError as e:
+            print(f"  [WARN] Could not remove combined-ca.pem: {e}")
+    print()
+    print("[UNPATCH] All done.")
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +479,18 @@ def do_status(ide_path: str) -> None:
     if not any_bak:
         print()
         print("  No backups found. Run 'python patcher.py patch' to patch and create backups.")
+
+    # Check SSL_CERT_FILE injection state
+    ssl_injected = SSL_CERT_MARKER in content
+    combined_ca_path = (Path(__file__).parent / COMBINED_CA_RELATIVE).resolve()
+    print()
+    print("  Language server binary TLS trust:")
+    if ssl_injected:
+        print(f"    SSL_CERT_FILE : INJECTED into main.js")
+        print(f"    combined-ca.pem : {'EXISTS' if combined_ca_path.exists() else 'MISSING (re-run patch)'}")
+    else:
+        print(f"    SSL_CERT_FILE : NOT injected")
+        print(f"    combined-ca.pem : {'EXISTS' if combined_ca_path.exists() else 'not created'}")
 
     print()
 

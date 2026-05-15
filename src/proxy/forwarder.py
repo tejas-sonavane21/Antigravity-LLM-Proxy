@@ -59,15 +59,38 @@ _SKIP_RESPONSE_HEADERS = frozenset({
 
 # Single shared AsyncClient for all upstream Google calls.
 # verify=True — real SSL to Google (not our proxy CA).
-# timeout=60s — generous for init endpoints that can be slow.
+#
+# Timeout breakdown (not a single flat value):
+#   connect= 10s  — TLS + TCP handshake to Google
+#   read   = 55s  — longest init endpoint (loadCodeAssist, listExperiments)
+#   write  = 10s  — sending the request body
+#   pool   =  5s  — time to acquire a connection from the pool
+#
+# keepalive_expiry = 20s — proactively close idle pooled connections.
+#   Google closes idle keepalive connections at ~60-90s server-side.
+#   Without this, the pool holds stale TCP sockets; the next request hangs
+#   waiting for a response on a dead socket until asyncio detects the RST.
+#   Setting 20s ensures we close connections before Google does.
+#
+# max_keepalive_connections = 10 — cap idle pool size (3 hosts × headroom)
+_TIMEOUT = httpx.Timeout(connect=10.0, read=55.0, write=10.0, pool=5.0)
+_LIMITS = httpx.Limits(
+    max_keepalive_connections=10,
+    max_connections=20,
+    keepalive_expiry=20.0,   # seconds — close idle connections proactively
+)
 _client: httpx.AsyncClient | None = None
 
 
 def _get_client() -> httpx.AsyncClient:
-    """Lazy-init the shared httpx client."""
+    """Lazy-init the shared httpx client with proper pool and timeout config."""
     global _client
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(verify=True, timeout=60.0)
+        _client = httpx.AsyncClient(
+            verify=True,
+            timeout=_TIMEOUT,
+            limits=_LIMITS,
+        )
     return _client
 
 
@@ -150,7 +173,12 @@ async def forward_to_google(
                 headers=fwd_headers,
                 content=body,
             )
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.RequestError) as exc:
+        except (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.RequestError,
+            httpx.PoolTimeout,
+        ) as exc:
             last_error = f"{host}: {exc}"
             log.warning(f"  → {host} | FAILED ({type(exc).__name__}: {exc})")
             continue  # Try next host
