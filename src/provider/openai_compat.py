@@ -44,6 +44,44 @@ from src.converter.gemini_to_openai import convert_request
 from src.converter.openai_to_gemini import convert_response
 
 
+# ---------------------------------------------------------------------------
+# Shared HTTP client for provider requests
+# ---------------------------------------------------------------------------
+#
+# Per-phase timeout breakdown:
+#   connect =  15s  — TLS + TCP handshake to external provider
+#   read    = 300s  — AI responses can take minutes; keep generous
+#   write   =  15s  — sending the (potentially large) request body
+#   pool    =   5s  — time to acquire a free connection from the pool
+#
+# keepalive_expiry = 20s — proactively close idle connections.
+#   External providers close idle HTTP/1.1 keepalive connections at varying
+#   intervals. Without this, pooled sockets go stale and the next request
+#   hangs silently until asyncio detects the RST (the 'silent freeze' bug).
+#
+_PROVIDER_TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=15.0, pool=5.0)
+_PROVIDER_LIMITS  = httpx.Limits(
+    max_keepalive_connections=5,
+    max_connections=10,
+    keepalive_expiry=20.0,
+)
+_provider_client: httpx.AsyncClient | None = None
+
+
+def _get_provider_client() -> httpx.AsyncClient:
+    """Lazy-init the shared provider httpx client."""
+    global _provider_client
+    if _provider_client is None or _provider_client.is_closed:
+        _provider_client = httpx.AsyncClient(
+            timeout=_PROVIDER_TIMEOUT,
+            limits=_PROVIDER_LIMITS,
+        )
+    return _provider_client
+
+
+# External API timeout in seconds (kept for reference; actual timeout is above).
+_REQUEST_TIMEOUT = 300.0
+
 # Transient HTTP status codes that warrant a retry attempt.
 # Permanent errors (400, 401, 403, 404, etc.) are not retried.
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
@@ -55,9 +93,6 @@ _MAX_RETRIES = 3
 # Backoff multiplier in seconds per attempt.
 # attempt=2 → 0.5s, attempt=3 → 1.0s  (proxy.rs L1471: 500ms × attempt)
 _BACKOFF_MULTIPLIER = 0.5
-
-# External API timeout in seconds (provider.rs L529).
-_REQUEST_TIMEOUT = 300.0
 
 
 class OpenAICompatProvider:
@@ -152,90 +187,90 @@ class OpenAICompatProvider:
         # --- Step 4: Send with retry ---
         last_error: str = ""
         last_status: int = 0
+        client = _get_provider_client()
 
-        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
-            for attempt in range(1, _MAX_RETRIES + 1):
-                # Backoff before retry attempts (not before the first attempt)
-                if attempt > 1:
-                    backoff = _BACKOFF_MULTIPLIER * attempt
-                    self._log.warning(
-                        f"  Retry {attempt}/{_MAX_RETRIES} "
-                        f"[{self._provider.name}], backoff={backoff:.1f}s"
-                    )
-                    await asyncio.sleep(backoff)
+        for attempt in range(1, _MAX_RETRIES + 1):
+            # Backoff before retry attempts (not before the first attempt)
+            if attempt > 1:
+                backoff = _BACKOFF_MULTIPLIER * attempt
+                self._log.warning(
+                    f"  Retry {attempt}/{_MAX_RETRIES} "
+                    f"[{self._provider.name}], backoff={backoff:.1f}s"
+                )
+                await asyncio.sleep(backoff)
 
-                try:
-                    resp = await client.post(
-                        target_url,
-                        json=openai_req,
-                        headers=headers,
-                    )
-                except httpx.TimeoutException as exc:
-                    last_error = f"Request timed out: {exc}"
-                    last_status = 504
-                    self._log.error(
-                        f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
-                        f"timeout"
-                    )
-                    continue  # timeout is always retryable
-
-                except httpx.RequestError as exc:
-                    last_error = f"Connection error: {exc}"
-                    last_status = 502
-                    self._log.error(
-                        f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
-                        f"connection error: {exc}"
-                    )
-                    continue  # connection errors are retryable
-
-                last_status = resp.status_code
-
-                if resp.status_code < 400:
-                    # --- Success path ---
-                    if attempt > 1:
-                        self._log.info(
-                            f"  [{self._provider.name}] retry succeeded "
-                            f"on attempt {attempt}"
-                        )
-                    break  # exit retry loop
-
-                # --- Error path ---
-                try:
-                    err_preview = resp.text[:500]
-                except Exception:
-                    err_preview = f"<status {resp.status_code}>"
-
-                last_error = err_preview
-
-                if resp.status_code in _RETRYABLE_STATUSES:
-                    self._log.warning(
-                        f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
-                        f"transient error {resp.status_code}: "
-                        f"{err_preview[:200]}"
-                    )
-                    # continue to next attempt
-                else:
-                    # Permanent error — do not retry
-                    self._log.error(
-                        f"  [{self._provider.name}] permanent error "
-                        f"{resp.status_code}: {err_preview[:200]}"
-                    )
-                    return self._error_sse(
-                        resp.status_code,
-                        f"Provider error {resp.status_code}: {err_preview}",
-                    )
-
-            else:
-                # All retries exhausted
+            try:
+                resp = await client.post(
+                    target_url,
+                    json=openai_req,
+                    headers=headers,
+                )
+            except httpx.TimeoutException as exc:
+                last_error = f"Request timed out: {exc}"
+                last_status = 504
                 self._log.error(
-                    f"  [{self._provider.name}] all {_MAX_RETRIES} attempts failed. "
-                    f"Last error: {last_error[:300]}"
+                    f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
+                    f"timeout"
+                )
+                continue  # timeout is always retryable
+
+            except httpx.RequestError as exc:
+                last_error = f"Connection error: {exc}"
+                last_status = 502
+                self._log.error(
+                    f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
+                    f"connection error: {exc}"
+                )
+                continue  # connection errors are retryable
+
+            last_status = resp.status_code
+
+            if resp.status_code < 400:
+                # --- Success path ---
+                if attempt > 1:
+                    self._log.info(
+                        f"  [{self._provider.name}] retry succeeded "
+                        f"on attempt {attempt}"
+                    )
+                break  # exit retry loop
+
+            # --- Error path ---
+            try:
+                err_preview = resp.text[:500]
+            except Exception:
+                err_preview = f"<status {resp.status_code}>"
+
+            last_error = err_preview
+
+            if resp.status_code in _RETRYABLE_STATUSES:
+                self._log.warning(
+                    f"  [{self._provider.name}] attempt {attempt}/{_MAX_RETRIES}: "
+                    f"transient error {resp.status_code}: "
+                    f"{err_preview[:200]}"
+                )
+                # continue to next attempt
+            else:
+                # Permanent error — do not retry
+                self._log.error(
+                    f"  [{self._provider.name}] permanent error "
+                    f"{resp.status_code}: {err_preview[:200]}"
                 )
                 return self._error_sse(
-                    502,
-                    f"Provider [{self._provider.name}] failed after "
-                    f"{_MAX_RETRIES} retries: {last_error[:300]}",
+                    resp.status_code,
+                    f"Provider error {resp.status_code}: {err_preview}",
                 )
+
+        else:
+            # All retries exhausted
+            self._log.error(
+                f"  [{self._provider.name}] all {_MAX_RETRIES} attempts failed. "
+                f"Last error: {last_error[:300]}"
+            )
+            return self._error_sse(
+                502,
+                f"Provider [{self._provider.name}] failed after "
+                f"{_MAX_RETRIES} retries: {last_error[:300]}",
+            )
 
         # --- Step 5: Parse and convert response ---
         self._log.info(
