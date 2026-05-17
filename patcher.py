@@ -67,6 +67,24 @@ URL_PATTERN = re.compile(
 # Regex for reading the current patched target from status check
 PATCHED_URL_PATTERN = re.compile(r"https?://127\.0\.0\.1:(\d+)")
 
+# ---------------------------------------------------------------------------
+# Pool Trigger Patch
+# ---------------------------------------------------------------------------
+
+# Exact string that ends AntigravityAuthMainService.M() in main.js.
+# Confirmed by grep: single occurrence at char offset ~11,561,180.
+# The method body is fully minified onto one line; this tail is unique.
+POOL_TRIGGER_TARGET = "this.r=setInterval(t,xTa)}"
+
+# Code injected immediately after the setInterval line, still inside M() body.
+# Uses 'require' (Node.js built-in — always available in Electron main process).
+# global.__agProxyTriggerServer guard prevents double-bind if M() is called again.
+# Port 9528 = proxy port (9527) + 1.
+POOL_TRIGGER_INJECT = """;(()=>{if(!global.__agProxyTriggerServer){const _h=require('http'),_s=_h.createServer(async(req,res)=>{if(req.url==='/refresh-models'&&req.method==='GET'){try{const n=(await this.n).get(),a=R6(n);if(a)await this.refreshUserStatus(a);res.writeHead(200);res.end('ok')}catch(e){res.writeHead(500);res.end(e.message)}}else{res.writeHead(404);res.end()}});_s.listen(9528,'127.0.0.1');global.__agProxyTriggerServer=_s}})()"""
+
+# Sentinel to detect whether the pool trigger is already applied
+POOL_TRIGGER_SENTINEL = "__agProxyTriggerServer"
+
 
 # ---------------------------------------------------------------------------
 # Config Loader
@@ -242,7 +260,7 @@ def do_patch(ide_path: str, target_url: str) -> None:
     else:
         print(f"[PATCH] JS done: {patched_count} patched, {skipped_count} already patched")
     print()
-    print("[PATCH] All done.")
+    print("[PATCH] All done. Run 'python patcher.py pool-trigger-patch' to also inject the HTTP refresh trigger.")
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +314,7 @@ def do_unpatch(ide_path: str) -> None:
             print(f"          {missing_count} file(s) had no backup.")
 
     print()
-    print("[UNPATCH] All done.")
+    print("[UNPATCH] All done. Note: pool-trigger-patch must be manually reverted by running 'python patcher.py unpatch' (restores from .js.bak).")
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +355,13 @@ def do_status(ide_path: str) -> None:
     else:
         print(f"  Patch state : NOT PATCHED")
 
+    # Check pool trigger state
+    print()
+    if POOL_TRIGGER_SENTINEL in content:
+        print("  Pool trigger: INJECTED (port 9528 HTTP server present)")
+    else:
+        print("  Pool trigger: NOT INJECTED (run 'python patcher.py pool-trigger-patch')")
+
     # List backup files
     print()
     print("  Backup files (.js.bak):")
@@ -359,6 +384,90 @@ def do_status(ide_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pool Trigger Patch
+# ---------------------------------------------------------------------------
+
+def do_pool_trigger_patch(ide_path: str) -> None:
+    """
+    Inject the HTTP refresh trigger into AntigravityAuthMainService.M() in main.js.
+
+    The trigger is a self-invoking anonymous function appended to the end of M(),
+    right after 'this.r=setInterval(t,xTa)'. It starts a minimal Node.js HTTP server
+    on 127.0.0.1:9528 that, when called with GET /refresh-models, invokes
+    refreshUserStatus() — causing Antigravity to make a fresh fetchAvailableModels
+    request that our proxy can intercept and patch with the next pool entry's context.
+
+    Target method (minified, single line in main.js):
+        M(){this.r&&clearInterval(this.r);const t=async()=>{...};t(),this.r=setInterval(t,xTa)}
+
+    Confirmed unique occurrence at ~char 11,561,180.
+    """
+    main_js = Path(ide_path) / "main.js"
+
+    print(f"\n[POOL-TRIGGER] IDE path: {ide_path}")
+    print(f"[POOL-TRIGGER] Target  : {main_js}")
+    print()
+
+    if not main_js.exists():
+        _error(f"main.js not found at: {main_js}")
+
+    try:
+        with open(main_js, "r", encoding="utf-8", newline="") as f:
+            content = f.read()
+    except OSError as e:
+        _error(f"Could not read main.js: {e}")
+
+    # Idempotency check — don't inject twice
+    if POOL_TRIGGER_SENTINEL in content:
+        print("  [ALREADY] Pool trigger is already injected. Nothing to do.")
+        return
+
+    # Verify target string is present
+    if POOL_TRIGGER_TARGET not in content:
+        _error(
+            f"Injection target not found in main.js.\n"
+            f"Expected: {POOL_TRIGGER_TARGET!r}\n"
+            f"The IDE may have been updated. Inspect main.js around 'refreshUserStatus' "
+            f"and update POOL_TRIGGER_TARGET in patcher.py."
+        )
+
+    # Count occurrences (must be exactly 1 for safe injection)
+    count = content.count(POOL_TRIGGER_TARGET)
+    if count != 1:
+        _error(
+            f"Expected exactly 1 occurrence of the injection target, found {count}.\n"
+            f"Target: {POOL_TRIGGER_TARGET!r}\n"
+            f"Manual inspection of main.js required."
+        )
+
+    # Inject: replace the closing brace of M() with: <setInterval>;(()=>{...})()}
+    # The injected IIFE runs once when M() is called. The guard prevents re-entry.
+    patched = content.replace(
+        POOL_TRIGGER_TARGET,
+        POOL_TRIGGER_TARGET + POOL_TRIGGER_INJECT,
+        1,  # replace only the first (and only) occurrence
+    )
+
+    # Write
+    try:
+        with open(main_js, "w", encoding="utf-8", newline="") as f:
+            f.write(patched)
+    except OSError as e:
+        _error(
+            f"Write failed: {e}\n"
+            f"Make sure Antigravity IDE is fully closed and retry."
+        )
+
+    print("  [INJECTED] Pool trigger HTTP server injected into main.js.")
+    print("             Restart Antigravity IDE for the patch to take effect.")
+    print()
+    print("  Trigger endpoint: GET http://127.0.0.1:9528/refresh-models")
+    print("  What it does    : Forces Antigravity to call refreshUserStatus(),")
+    print("                    which triggers a fresh fetchAvailableModels request.")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Help
 # ---------------------------------------------------------------------------
 
@@ -369,15 +478,19 @@ Antigravity IDE Patcher
 Redirects IDE API traffic to the local proxy and restores original files.
 
 Commands:
-  python patcher.py patch     Apply patch to IDE JS files
-  python patcher.py unpatch   Restore original files from .js.bak backups
-  python patcher.py status    Show current patch state and backup info
+  python patcher.py patch               Apply URL redirect + TLS patch to IDE JS files
+  python patcher.py unpatch             Restore original files from .js.bak backups
+  python patcher.py status              Show current patch state and backup info
+  python patcher.py pool-trigger-patch  Inject the HTTP refresh trigger into main.js
+                                        (enables on-demand fetchAvailableModels refresh
+                                         via GET http://127.0.0.1:9528/refresh-models)
 
 Notes:
   - Close Antigravity IDE before running patch or unpatch.
   - Proxy (python src/main.py) must be running when using the patched IDE.
   - Backups are created automatically on first patch. They are deleted on unpatch.
   - Re-running 'patch' on already-patched files is safe (idempotent).
+  - pool-trigger-patch is also idempotent and safe to run multiple times.
 """)
 
 
@@ -402,7 +515,7 @@ def main() -> None:
 
     command = sys.argv[1].lower()
 
-    if command in ("patch", "unpatch", "status"):
+    if command in ("patch", "unpatch", "status", "pool-trigger-patch"):
         ide_path, target_url = load_patcher_config()
     elif command in ("-h", "--help", "help"):
         print_help()
@@ -418,6 +531,8 @@ def main() -> None:
         do_unpatch(ide_path)
     elif command == "status":
         do_status(ide_path)
+    elif command == "pool-trigger-patch":
+        do_pool_trigger_patch(ide_path)
 
 
 if __name__ == "__main__":
