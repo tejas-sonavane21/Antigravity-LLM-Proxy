@@ -185,6 +185,12 @@ def main() -> None:
     registry = ProviderRegistry()
     registry.load_from_config(config.providers)
 
+    # --- Phase 5b: Configure router feature flags ---
+    from src.proxy import router as _router_module
+    _router_module.configure(
+        dump_model_responses=config.proxy.dump_model_responses,
+    )
+
     # --- Phase 6: Create and start proxy server ---
     from src.proxy.server import create_app
 

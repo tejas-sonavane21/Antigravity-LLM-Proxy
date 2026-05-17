@@ -30,6 +30,23 @@ from src.proxy.forwarder import forward_to_google
 
 log = logging.getLogger("proxy.router")
 
+# ---------------------------------------------------------------------------
+# Feature flags (set at startup via configure())
+# ---------------------------------------------------------------------------
+
+# When True: dump the full model list on every fetchAvailableModels response.
+# Useful for investigating Antigravity updates (new models, changed metadata).
+# Set via config.json → proxy.dump_model_responses
+_dump_model_responses: bool = False
+
+
+def configure(*, dump_model_responses: bool = False) -> None:
+    """Apply runtime configuration to this module. Call once at startup."""
+    global _dump_model_responses
+    _dump_model_responses = dump_model_responses
+    if dump_model_responses:
+        log.info("[router] Model response dumping ENABLED (dump_model_responses=true)")
+
 
 # ---------------------------------------------------------------------------
 # Request categories
@@ -180,7 +197,11 @@ async def route_request(
     )
 
     # ── Q3 INVESTIGATOR: dump fetchAvailableModels response ──────────
-    if "fetchAvailableModels" in path or "fetchAvailableCodeAssistModels" in path:
+    # Controlled by config.proxy.dump_model_responses (default: False).
+    # Toggle on to inspect model metadata after Antigravity updates.
+    if _dump_model_responses and (
+        "fetchAvailableModels" in path or "fetchAvailableCodeAssistModels" in path
+    ):
         import json as _json
         log.info("=" * 60)
         log.info("[Q3-DUMP] fetchAvailableModels response intercepted")

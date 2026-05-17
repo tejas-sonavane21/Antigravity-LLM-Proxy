@@ -33,6 +33,7 @@ class ProxyConfig:
     port: int
     log_level: str          # "DEBUG" | "INFO" | "WARNING" | "ERROR"
     include_thoughts: bool  # whether to include thought parts in upstream requests
+    dump_model_responses: bool = False  # when True: Q3-DUMP runs on fetchAvailableModels
 
 
 @dataclass
@@ -210,6 +211,7 @@ def _parse_config(raw: dict) -> AppConfig:
         port=proxy_raw["port"],
         log_level=proxy_raw["log_level"].upper(),
         include_thoughts=proxy_raw.get("include_thoughts", False),
+        dump_model_responses=bool(proxy_raw.get("dump_model_responses", False)),
     )
 
     upstream = UpstreamConfig(
