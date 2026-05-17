@@ -12,6 +12,7 @@ reference_*
 
 # Documentation
 *.md
+docs/
 
 # Python Cache & Build
 __pycache__/

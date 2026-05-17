@@ -179,4 +179,39 @@ async def route_request(
         upstream_hosts=upstream_hosts,
     )
 
+    # ── Q3 INVESTIGATOR: dump fetchAvailableModels response ──────────
+    if "fetchAvailableModels" in path or "fetchAvailableCodeAssistModels" in path:
+        import json as _json
+        log.info("=" * 60)
+        log.info("[Q3-DUMP] fetchAvailableModels response intercepted")
+        log.info(f"[Q3-DUMP] Status: {status} | Body size: {len(resp_body)}B")
+        try:
+            _data = _json.loads(resp_body)
+            # "models" is a dict: { "model-id": { metadata... } }
+            _models_dict = _data.get("models") or {}
+            if isinstance(_models_dict, dict) and _models_dict:
+                log.info(f"[Q3-DUMP] Found {len(_models_dict)} model(s):")
+                for _mid, _m in _models_dict.items():
+                    _ctx  = _m.get("maxTokens") or "N/A"
+                    _out  = _m.get("maxOutputTokens") or "N/A"
+                    _disp = _m.get("displayName") or ""
+                    _think = _m.get("supportsThinking")
+                    _tbud  = _m.get("thinkingBudget")
+                    _int   = _m.get("isInternal", False)
+                    _api   = _m.get("apiProvider") or ""
+                    log.info(
+                        f"  [{_mid}]  display={_disp!r}  "
+                        f"maxTokens={_ctx}  maxOutput={_out}  "
+                        f"thinking={_think}  thinkBudget={_tbud}  "
+                        f"internal={_int}  api={_api}"
+                    )
+            else:
+                log.info("[Q3-DUMP] Unexpected structure — raw JSON (first 3000 chars):")
+                log.info(_json.dumps(_data, indent=2)[:3000])
+        except Exception as _e:
+            log.info(f"[Q3-DUMP] Parse error: {_e}")
+            log.info(f"[Q3-DUMP] Raw body (first 1000 chars): {resp_body[:1000]}")
+        log.info("=" * 60)
+    # ── end Q3 INVESTIGATOR ──────────────────────────────────────────
+
     return (status, resp_headers, resp_body)
