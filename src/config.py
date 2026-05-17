@@ -76,12 +76,29 @@ class PatcherConfig:
 
 
 @dataclass
+class PoolSettings:
+    """
+    Global settings that apply to the entire model pool.
+    Lives at config.json `model_pool.pool_settings`.
+    """
+    safety_buffer_tokens: int      # default 8192 — subtracted from usable_tokens
+    all_cooled_fallback: str       # "passthrough" OR a specific model name string
+                                   # e.g. "claude-sonnet-4-6"
+    mapped_model: str              # the IDE model name we intercept, e.g. "gpt-oss-120b-medium"
+
+
+@dataclass
 class AppConfig:
     proxy: ProxyConfig
     upstream: UpstreamConfig
     tls: TlsConfig
-    providers: list         # list[ProviderConfig]
+    providers: list         # list[ProviderConfig] — kept for backward compat
     patcher: PatcherConfig
+    pool_settings: PoolSettings | None = None  # None = no pool configured
+    # list[PoolEntry] is NOT stored here; it lives in PoolPicker after startup
+    # The raw model_pool dict is stored separately so PoolPicker can write back
+    # cooldown state changes to the correct location in config.json.
+    raw_model_pool: dict | None = None         # raw dict from config.json["model_pool"]
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +157,7 @@ def _validate_config(raw: dict) -> None:
     for section in ("proxy", "upstream", "tls", "providers", "patcher"):
         if section not in raw:
             raise ConfigError(f"Missing required section: '{section}'")
+    # model_pool is optional — validated separately below if present
 
     # --- proxy ---
     proxy = raw["proxy"]
@@ -248,12 +266,25 @@ def _parse_config(raw: dict) -> AppConfig:
         ide_path=patcher_raw.get("ide_path"),     # optional field
     )
 
+    # --- model_pool (optional) ---
+    pool_settings: PoolSettings | None = None
+    raw_model_pool: dict | None = raw.get("model_pool")
+    if raw_model_pool is not None:
+        ps = raw_model_pool.get("pool_settings", {})
+        pool_settings = PoolSettings(
+            safety_buffer_tokens=int(ps.get("safety_buffer_tokens", 8192)),
+            all_cooled_fallback=str(ps.get("all_cooled_fallback", "passthrough")),
+            mapped_model=str(raw_model_pool.get("mapped_model", "gpt-oss-120b-medium")),
+        )
+
     return AppConfig(
         proxy=proxy,
         upstream=upstream,
         tls=tls,
         providers=providers,
         patcher=patcher,
+        pool_settings=pool_settings,
+        raw_model_pool=raw_model_pool,
     )
 
 

@@ -389,7 +389,10 @@ class OpenAICompatProvider:
 
                     # Process the SSE stream line by line
                     event_count = 0
-                    async for sse_bytes in self._iter_stream_events(resp, target_model):
+                    async for sse_bytes in self._iter_stream_events(
+                        resp, target_model,
+                        thinking_field=None,  # legacy provider path: check both fields
+                    ):
                         event_count += 1
                         yield sse_bytes
 
@@ -426,10 +429,19 @@ class OpenAICompatProvider:
         self,
         resp: httpx.Response,
         target_model: str,
+        thinking_field: str | None = None,
     ) -> AsyncIterator[bytes]:
         """
         Read the provider's SSE wire format line by line and yield
         converted Gemini SSE bytes.
+
+        Args:
+            resp: The live httpx streaming response.
+            target_model: Provider model name (used for Gemini event fields).
+            thinking_field: The SSE delta key that carries thinking/reasoning tokens.
+                - SiliconFlow (all reasoning models): "reasoning_content"
+                - OpenCode / standard OpenAI:         "reasoning"
+                - None: check both "reasoning" and "thinking_content" (legacy fallback)
 
         Invariants maintained:
           - Text/thought partial events have finishReason=""
@@ -549,12 +561,17 @@ class OpenAICompatProvider:
                 if finish:
                     finish_reason = finish
 
-                # ── Reasoning / thinking ──────────────────────────────
-                reasoning_delta = (
-                    delta.get("reasoning") or
-                    delta.get("thinking_content") or
-                    ""
-                )
+                # ── Reasoning / thinking ──────────────────────────────────
+                # Priority: per-entry configured field → "reasoning" → "thinking_content"
+                if thinking_field is not None:
+                    reasoning_delta = delta.get(thinking_field) or ""
+                else:
+                    # Legacy fallback: try both standard field names
+                    reasoning_delta = (
+                        delta.get("reasoning") or
+                        delta.get("thinking_content") or
+                        ""
+                    )
                 if reasoning_delta:
                     self._log.debug(
                         f"  chunk#{chunk_num}: thought +{len(reasoning_delta)}ch"
