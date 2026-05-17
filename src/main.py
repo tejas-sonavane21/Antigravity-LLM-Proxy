@@ -122,6 +122,20 @@ def log_config_summary(config: AppConfig) -> None:
     if config.patcher.ide_path:
         log.debug(f"Patcher IDE path override: {config.patcher.ide_path}")
 
+    # Pool summary
+    if config.pool_settings is not None:
+        ps = config.pool_settings
+        raw_pool = config.raw_model_pool or {}
+        entries_raw = raw_pool.get("entries", [])
+        enabled_count = sum(1 for e in entries_raw if e.get("enabled", True))
+        log.info(
+            f"Model pool: mapped_model={ps.mapped_model!r} | "
+            f"{len(entries_raw)} entries ({enabled_count} enabled) | "
+            f"fallback={ps.all_cooled_fallback!r}"
+        )
+    else:
+        log.info("Model pool: NOT configured (pool routing disabled)")
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -190,6 +204,47 @@ def main() -> None:
     _router_module.configure(
         dump_model_responses=config.proxy.dump_model_responses,
     )
+
+    # --- Pool: Initialize PoolPicker ---
+    if config.pool_settings is not None and config.raw_model_pool is not None:
+        from src.pool.config_parser import parse_pool_entries
+        from src.pool.picker import init_picker
+
+        log.info("-" * 60)
+        log.info("Initializing model key pool...")
+        try:
+            pool_entries, _ = parse_pool_entries(config.raw_model_pool)
+
+            # Load the raw full config dict so _persist_cooldown_state
+            # can write the ENTIRE config.json atomically (not just pool section).
+            import json as _json
+            from pathlib import Path as _Path
+            _raw_full_cfg = _json.loads(_Path("config.json").read_text(encoding="utf-8"))
+
+            picker = init_picker(
+                entries=pool_entries,
+                pool_settings=config.pool_settings,
+                config_path="config.json",
+                raw_config=_raw_full_cfg,   # full config dict for atomic writes
+            )
+            log.info(
+                f"Pool ready: {len(pool_entries)} entries | "
+                f"fallback={config.pool_settings.all_cooled_fallback!r}"
+            )
+            # Log each entry's initial state at DEBUG
+            for s in picker.status_summary():
+                cooled = f" [COOLED until {s['cooldown_until']}]" if s["is_cooled"] else ""
+                log.debug(
+                    f"  [{s['id']}] {s['label']}{cooled} | "
+                    f"usable={s['usable_tokens']} | "
+                    f"thinking_field={s['response_thinking_field']!r}"
+                )
+        except (ValueError, KeyError) as exc:
+            log.error(f"Pool initialization failed: {exc}")
+            log.error("Check model_pool.entries in config.json.")
+            sys.exit(1)
+    else:
+        log.info("Model pool not configured — pool routing disabled.")
 
     # --- Phase 6: Create and start proxy server ---
     from src.proxy.server import create_app
