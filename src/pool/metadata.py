@@ -1,0 +1,122 @@
+"""
+src/pool/metadata.py — fetchAvailableModels Response Patcher
+=============================================================
+Patches the Google fetchAvailableModels response body to replace the
+mapped model's maxTokens (and related fields) with the pool entry's
+computed usable_tokens value.
+
+Design rules (from model_list_analysis.md Section 5):
+  - ALWAYS cache and return the FULL Google response body (all 18 models).
+  - ONLY modify the fields of the mapped model (gpt-oss-120b-medium).
+  - Never modify any other model's metadata.
+  - If the mapped model is missing from the response (upstream rename/removal),
+    log a warning and return the body unmodified — never crash the IDE.
+
+The patching is deliberately minimal:
+  - maxTokens        -> pool_entry.usable_tokens  (context window visible to IDE)
+  - supportsThinking -> True                       (all our pool models support thinking)
+  - thinkingBudget   -> entry.thinking.budget if set, else leave as-is
+
+We do NOT patch:
+  - maxOutputTokens  (we let the provider cap its own output naturally)
+  - displayName      (cosmetic, not functional)
+  - apiProvider      (Google-internal routing label, IDE reads it but does not act on it)
+  - Any other model's fields
+
+Reference: pool_implementation_plan.md Phase 4 Step 4.2
+           model_list_analysis.md Section 5 (Finalized Caching Strategy)
+"""
+
+import json
+import logging
+from typing import Optional
+
+from src.pool.entry import PoolEntry
+
+_log = logging.getLogger("pool.metadata")
+
+
+def patch_model_metadata(
+    response_body: bytes,
+    mapped_model: str,
+    pool_entry: Optional[PoolEntry],
+) -> bytes:
+    """
+    Patch the mapped model's maxTokens in a full fetchAvailableModels response.
+
+    Args:
+        response_body: Raw bytes of Google's fetchAvailableModels response.
+        mapped_model:  The model ID to patch (e.g. "gpt-oss-120b-medium").
+                       This must match the key in the response["models"] dict.
+        pool_entry:    The pool entry whose usable_tokens to advertise.
+                       If None, the body is returned completely unmodified.
+
+    Returns:
+        The patched response body bytes (all models present, only mapped model
+        fields changed). Returns original bytes on any parse error.
+
+    Safety:
+        - JSON parse errors: returns original bytes, logs warning
+        - Mapped model missing: returns original bytes, logs warning
+        - pool_entry is None: returns original bytes (no picker available)
+    """
+    if pool_entry is None:
+        return response_body
+
+    # Parse
+    try:
+        data = json.loads(response_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        _log.warning(
+            f"[PATCH] Failed to parse fetchAvailableModels body: {exc}. "
+            f"Returning original unmodified."
+        )
+        return response_body
+
+    models = data.get("models")
+    if not isinstance(models, dict):
+        _log.warning(
+            f"[PATCH] Unexpected models structure (type={type(models).__name__}). "
+            f"Returning original unmodified."
+        )
+        return response_body
+
+    if mapped_model not in models:
+        _log.warning(
+            f"[PATCH] Mapped model {mapped_model!r} not found in "
+            f"fetchAvailableModels response ({len(models)} models present). "
+            f"Google may have renamed or removed it. "
+            f"Returning full original response unmodified."
+        )
+        return response_body
+
+    # Patch only the mapped model's fields
+    target = models[mapped_model]
+    old_tokens = target.get("maxTokens", "?")
+
+    # maxTokens: advertise the pool entry's usable_tokens
+    # This is: context_window - safety_buffer_tokens
+    target["maxTokens"] = pool_entry.usable_tokens
+
+    # supportsThinking: all current pool models support thinking
+    target["supportsThinking"] = True
+
+    # thinkingBudget: use pool entry's configured budget if set
+    if pool_entry.thinking.budget is not None:
+        target["thinkingBudget"] = pool_entry.thinking.budget
+
+    _log.info(
+        f"[PATCH] fetchAvailableModels: {mapped_model!r} "
+        f"maxTokens {old_tokens} -> {pool_entry.usable_tokens} "
+        f"(entry={pool_entry.id}, ctx={pool_entry.context_window}, "
+        f"buffer={pool_entry.safety_buffer_tokens})"
+    )
+
+    try:
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        _log.warning(
+            f"[PATCH] Failed to re-serialise patched response: {exc}. "
+            f"Returning original unmodified."
+        )
+        return response_body

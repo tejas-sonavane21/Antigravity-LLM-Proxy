@@ -234,6 +234,55 @@ async def route_request(
     # 4. PASSTHROUGH -- forward to Google verbatim
     # ------------------------------------------------------------------
     model_tag = f" | model={model_name}" if model_name else ""
+
+    # ── fetchAvailableModels intercept ──────────────────────────────────
+    # Check BEFORE forwarding to Google so we can short-circuit on-demand
+    # requests (pending_advance=True) without wasting a Google round-trip.
+    _is_model_fetch = (
+        "fetchAvailableModels" in path or
+        "fetchAvailableCodeAssistModels" in path
+    )
+
+    if _is_model_fetch:
+        from src.pool.picker import get_picker
+        from src.pool.metadata import patch_model_metadata
+
+        _picker = get_picker()
+
+        if _picker is not None and _picker.pending_advance:
+            # ── ON-DEMAND path ──────────────────────────────────────────
+            # This request was triggered by trigger_model_refresh() after a
+            # POOL generation completed. The IDE fired fetchAvailableModels
+            # to get updated model metadata.
+            #
+            # We do NOT forward to Google. Instead:
+            #   1. Clear pending_advance flag
+            #   2. Advance the peek cursor to the NEXT pool entry
+            #   3. Serve cached body patched with that entry's usable_tokens
+            _picker.pending_advance = False
+            next_entry = _picker.advance_peek()
+
+            cached = _picker.get_cached_model_response()
+            if cached is not None and next_entry is not None:
+                mapped = _picker.pool_settings.mapped_model
+                patched_body = patch_model_metadata(cached, mapped, next_entry)
+                log.info(
+                    f"[FAMS] On-demand intercept: serving cached body "
+                    f"patched for [{next_entry.id}] "
+                    f"usable_tokens={next_entry.usable_tokens}"
+                )
+                sse_headers = {"Content-Type": "application/json"}
+                return (200, sse_headers, patched_body)
+            else:
+                # Cache not yet populated or no available entry --
+                # fall through to forward to Google normally
+                log.info(
+                    f"[FAMS] On-demand intercept: cache empty or no entry "
+                    f"available -- forwarding to Google"
+                )
+                _picker.pending_advance = False  # reset anyway
+
+    # ── Forward to Google ────────────────────────────────────────────────
     log.info(f"[PASS] {method} {path}{model_tag}")
 
     status, resp_headers, resp_body = await forward_to_google(
@@ -244,26 +293,46 @@ async def route_request(
         upstream_hosts=upstream_hosts,
     )
 
-    # ── Q3 INVESTIGATOR: dump fetchAvailableModels response ──────────
+    # ── fetchAvailableModels: natural request post-processing ─────────────
+    # Now that we have Google's fresh response, cache it and patch the
+    # mapped model's maxTokens to match the current peek entry's usable_tokens.
+    if _is_model_fetch and status == 200:
+        from src.pool.picker import get_picker
+        from src.pool.metadata import patch_model_metadata
+
+        _picker = get_picker()
+        if _picker is not None:
+            # Cache the full unmodified Google response for on-demand replays
+            _picker.set_cached_model_response(resp_body)
+
+            # Patch with the CURRENT peek entry's usable_tokens
+            # (this is what the IDE will use for its next generation request)
+            current_entry = _picker.peek()
+            if current_entry is not None:
+                mapped = _picker.pool_settings.mapped_model
+                resp_body = patch_model_metadata(resp_body, mapped, current_entry)
+                log.info(
+                    f"[FAMS] Natural request: cached + patched "
+                    f"[{current_entry.id}] usable_tokens={current_entry.usable_tokens}"
+                )
+
+    # ── Q3 INVESTIGATOR: dump fetchAvailableModels response ──────────────
+    # Runs AFTER patching so the dump shows exactly what the IDE receives.
     # Controlled by config.proxy.dump_model_responses (default: False).
-    # Toggle on to inspect model metadata after Antigravity updates.
-    if _dump_model_responses and (
-        "fetchAvailableModels" in path or "fetchAvailableCodeAssistModels" in path
-    ):
+    if _dump_model_responses and _is_model_fetch:
         import json as _json
         log.info("=" * 60)
         log.info("[Q3-DUMP] fetchAvailableModels response intercepted")
         log.info(f"[Q3-DUMP] Status: {status} | Body size: {len(resp_body)}B")
         try:
             _data = _json.loads(resp_body)
-            # "models" is a dict: { "model-id": { metadata... } }
             _models_dict = _data.get("models") or {}
             if isinstance(_models_dict, dict) and _models_dict:
                 log.info(f"[Q3-DUMP] Found {len(_models_dict)} model(s):")
                 for _mid, _m in _models_dict.items():
-                    _ctx  = _m.get("maxTokens") or "N/A"
-                    _out  = _m.get("maxOutputTokens") or "N/A"
-                    _disp = _m.get("displayName") or ""
+                    _ctx   = _m.get("maxTokens") or "N/A"
+                    _out   = _m.get("maxOutputTokens") or "N/A"
+                    _disp  = _m.get("displayName") or ""
                     _think = _m.get("supportsThinking")
                     _tbud  = _m.get("thinkingBudget")
                     _int   = _m.get("isInternal", False)
@@ -275,12 +344,12 @@ async def route_request(
                         f"internal={_int}  api={_api}"
                     )
             else:
-                log.info("[Q3-DUMP] Unexpected structure — raw JSON (first 3000 chars):")
+                log.info("[Q3-DUMP] Unexpected structure -- raw JSON (first 3000 chars):")
                 log.info(_json.dumps(_data, indent=2)[:3000])
         except Exception as _e:
             log.info(f"[Q3-DUMP] Parse error: {_e}")
             log.info(f"[Q3-DUMP] Raw body (first 1000 chars): {resp_body[:1000]}")
         log.info("=" * 60)
-    # ── end Q3 INVESTIGATOR ──────────────────────────────────────────
+    # ── end Q3 INVESTIGATOR ──────────────────────────────────────────────
 
     return (status, resp_headers, resp_body)
