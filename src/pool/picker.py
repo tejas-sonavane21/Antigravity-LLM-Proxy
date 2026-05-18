@@ -210,10 +210,11 @@ class PoolPicker:
         self.pending_advance: bool = False
         self._cached_model_response: bytes | None = None
 
-        # Internal peek cursor -- index into the sorted candidate list.
-        # Tracks which entry will be announced next via fetchAvailableModels.
-        # Independent of pick() -- peek advances only via advance_peek().
-        self._peek_cursor: int = 0
+        # Internal peek cursor — tracks which entry was last announced via
+        # fetchAvailableModels. Stored as entry ID (not index) so it remains
+        # correct even when _sorted_candidates() reorders as last_used_at updates.
+        # None = start-of-list (peek returns candidates[0]).
+        self._peek_entry_id: str | None = None
 
         total = len(entries)
         enabled = sum(1 for e in entries if e.enabled)
@@ -356,8 +357,15 @@ class PoolPicker:
         candidates = self._sorted_candidates()
         if not candidates:
             return None
-        idx = self._peek_cursor % len(candidates)
-        return candidates[idx]
+        if self._peek_entry_id is None:
+            # No prior peek — return the first (least-used) candidate
+            return candidates[0]
+        # Find current peek entry in the current sorted list
+        for c in candidates:
+            if c.id == self._peek_entry_id:
+                return c
+        # Peek entry was cooled/disabled — fall back to first candidate
+        return candidates[0]
 
     def advance_peek(self) -> PoolEntry | None:
         """
@@ -367,18 +375,41 @@ class PoolPicker:
         response. Ensures consecutive on-demand refreshes cycle through entries.
 
         Returns the newly selected peek entry, or None if pool is exhausted.
+
+        Implementation note:
+            Uses entry ID tracking (not an integer index) to avoid the
+            cursor-sort-mismatch bug: if the sorted list reorders between
+            calls (because last_used_at changed after a pick()), an integer
+            index would point to a DIFFERENT entry than intended.
+            By finding the current peek entry by ID and advancing from there,
+            we always return the entry that logically follows the last-announced
+            entry in the current sort order.
         """
         candidates = self._sorted_candidates()
         if not candidates:
-            self._peek_cursor = 0
+            self._peek_entry_id = None
             return None
-        self._peek_cursor = (self._peek_cursor + 1) % len(candidates)
-        entry = candidates[self._peek_cursor]
+
+        if self._peek_entry_id is None:
+            # First advance — start from the second candidate
+            self._peek_entry_id = candidates[0].id
+            idx = 0
+        else:
+            # Find current peek position by ID
+            idx = next(
+                (i for i, c in enumerate(candidates) if c.id == self._peek_entry_id),
+                0,  # fallback: start from top if peek entry was removed
+            )
+
+        # Advance to next
+        next_idx = (idx + 1) % len(candidates)
+        next_entry = candidates[next_idx]
+        self._peek_entry_id = next_entry.id
         _log.debug(
-            f"PoolPicker.advance_peek() -> [{entry.id}] "
-            f"usable={entry.usable_tokens}"
+            f"PoolPicker.advance_peek() -> [{next_entry.id}] "
+            f"usable={next_entry.usable_tokens}"
         )
-        return entry
+        return next_entry
 
     # ------------------------------------------------------------------
     # Cached model response (for fetchAvailableModels interceptor)
