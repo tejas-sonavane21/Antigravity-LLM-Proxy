@@ -74,13 +74,38 @@ PATCHED_URL_PATTERN = re.compile(r"https?://127\.0\.0\.1:(\d+)")
 # Exact string that ends AntigravityAuthMainService.M() in main.js.
 # Confirmed by grep: single occurrence at char offset ~11,561,180.
 # The method body is fully minified onto one line; this tail is unique.
+#
+# CRITICAL: We target the INTERIOR of M() — specifically the last statement
+# before the closing `}`. The IIFE must be injected INSIDE M(), not after it.
+#
+# WHY: The `}` closes the `M()` method. After a method in a class body, the
+# parser expects only another method definition or the class closing `}`. An
+# expression statement like `;(()=>{})()` appended AFTER the `}` would be
+# placed inside the class body — which is illegal ES syntax and causes:
+#   SyntaxError: Unexpected token '('
+#
+# CORRECT injection point: replace the closing `}` of M() with:
+#   ;(()=>{...IIFE...})()\ }    <-- IIFE runs inside M(), then M() closes
+#
+# This also fixes the `this` context: as an arrow function IIFE inside M(),
+# it captures M()'s `this` (the AntigravityAuthMainService instance).
+# The request handler `async(req,res)=>{}` is also an arrow, so it inherits
+# the same `this` — meaning `this.n` and `this.refreshUserStatus` work.
 POOL_TRIGGER_TARGET = "this.r=setInterval(t,xTa)}"
 
-# Code injected immediately after the setInterval line, still inside M() body.
-# Uses 'require' (Node.js built-in — always available in Electron main process).
-# global.__agProxyTriggerServer guard prevents double-bind if M() is called again.
-# Port 9528 = proxy port (9527) + 1.
-POOL_TRIGGER_INJECT = """;(()=>{if(!global.__agProxyTriggerServer){const _h=require('http'),_s=_h.createServer(async(req,res)=>{if(req.url==='/refresh-models'&&req.method==='GET'){try{const n=(await this.n).get(),a=R6(n);if(a)await this.refreshUserStatus(a);res.writeHead(200);res.end('ok')}catch(e){res.writeHead(500);res.end(e.message)}}else{res.writeHead(404);res.end()}});_s.listen(9528,'127.0.0.1');global.__agProxyTriggerServer=_s}})()"""
+# IIFE injected INSIDE M() before its closing `}`. Replaces the full target
+# string (including the `}`) with: <setInterval>;(()=>{...IIFE...})()}
+# So the replacement = IIFE body + M()'s closing }
+POOL_TRIGGER_INJECT = ";(()=>{if(!global.__agProxyTriggerServer){const _h=require('http'),_s=_h.createServer(async(req,res)=>{if(req.url==='/refresh-models'&&req.method==='GET'){try{const n=(await this.n).get(),a=R6(n);if(a)await this.refreshUserStatus(a);res.writeHead(200);res.end('ok')}catch(e){res.writeHead(500);res.end(e.message)}}else{res.writeHead(404);res.end()}});_s.listen(9528,'127.0.0.1');global.__agProxyTriggerServer=_s}})()"
+
+# The replacement string: POOL_TRIGGER_TARGET (minus its closing `}`) + IIFE + `}`
+# i.e.: 'this.r=setInterval(t,xTa)' + IIFE + '}'
+# This keeps the IIFE INSIDE M() and the `}` still closes M() correctly.
+POOL_TRIGGER_REPLACEMENT = (
+    POOL_TRIGGER_TARGET[:-1]  # strip the closing }
+    + POOL_TRIGGER_INJECT     # IIFE as last statement in M()
+    + "}"                     # M()'s closing } — now after the IIFE
+)
 
 # Sentinel to detect whether the pool trigger is already applied
 POOL_TRIGGER_SENTINEL = "__agProxyTriggerServer"
@@ -440,11 +465,20 @@ def do_pool_trigger_patch(ide_path: str) -> None:
             f"Manual inspection of main.js required."
         )
 
-    # Inject: replace the closing brace of M() with: <setInterval>;(()=>{...})()}
-    # The injected IIFE runs once when M() is called. The guard prevents re-entry.
+    # Inject: strip the closing `}` from the target, append the IIFE as the
+    # last statement inside M(), then re-add the closing `}` that closes M().
+    #
+    # Result structure:
+    #   M(){...this.r=setInterval(t,xTa);(()=>{...IIFE...})()}  <-- valid
+    #                                                       ^^^^
+    #                              IIFE runs inside M()  /  M() closes
+    #
+    # If we had appended AFTER the `}` instead, the IIFE would land in the
+    # ES class body — which only allows method definitions, not expression
+    # statements — producing SyntaxError: Unexpected token '('.
     patched = content.replace(
         POOL_TRIGGER_TARGET,
-        POOL_TRIGGER_TARGET + POOL_TRIGGER_INJECT,
+        POOL_TRIGGER_REPLACEMENT,
         1,  # replace only the first (and only) occurrence
     )
 
