@@ -3,17 +3,18 @@ src/proxy/router.py — Request Router
 ======================================
 Classifies every incoming IDE request and routes it to the correct handler:
 
-  1. TELEMETRY  → mock response (200 {} or 204)
-  2. PROVIDER   → model is mapped → full provider pipeline (streaming)
-  3. PASSTHROUGH→ everything else → forward to Google verbatim
+  1. TELEMETRY  -> mock response (200 {} or 204)
+  2. POOL       -> model matches pool mapped_model -> pool handler pipeline
+  3. PROVIDER   -> model has a mapping in ProviderRegistry -> legacy provider pipeline
+  4. PASSTHROUGH-> everything else -> forward to Google verbatim
 
-Classification is deliberately conservative: we only intercept AI generation
-requests that have a model mapping in the provider registry. Everything else
-(init, auth, model discovery, unmapped models) goes straight to Google.
+Classification priority: POOL takes precedence over PROVIDER for the
+primary mapped model (gpt-oss-120b-medium). This means when the pool is
+configured, the ProviderRegistry path for that model is bypassed entirely.
 
 Reference:
-  - proxy.rs L1452-L1566 — model extraction + provider routing + telemetry
-  - proxy.rs L1541-L1566 — telemetry identification and mocking
+  - proxy.rs L1452-L1566 -- model extraction + provider routing + telemetry
+  - proxy.rs L1541-L1566 -- telemetry identification and mocking
 """
 
 import logging
@@ -54,8 +55,9 @@ def configure(*, dump_model_responses: bool = False) -> None:
 
 class RequestCategory(Enum):
     """Classification result for an incoming request."""
-    TELEMETRY = "telemetry"       # Mock and swallow
-    PROVIDER = "provider"         # Route through provider pipeline
+    TELEMETRY   = "telemetry"     # Mock and swallow
+    POOL        = "pool"          # Route through pool handler pipeline
+    PROVIDER    = "provider"      # Route through legacy provider pipeline
     PASSTHROUGH = "passthrough"   # Forward to Google verbatim
 
 
@@ -100,22 +102,34 @@ def classify_request(
 
     Returns:
         ``(category, model_name_or_None, target_model_or_None)``
+        For POOL: target_model is None (entry selection done in handler).
+        For PROVIDER: target_model is the external model name.
     """
-    # 1. Telemetry — check first (cheapest)
+    # 1. Telemetry -- check first (cheapest)
     if _is_telemetry(path):
         return (RequestCategory.TELEMETRY, None, None)
 
     # 2. Extract model name from body, then from URL path
     model_name = extract_model_from_body(body) or extract_model_from_path(path)
 
-    # 3. If model found, check provider registry
+    # 3. Check pool first (takes priority over legacy ProviderRegistry path)
+    if model_name:
+        from src.pool.picker import get_picker
+        picker = get_picker()
+        if picker is not None:
+            # Pool is active -- check if this model is the pool's mapped model
+            pool_mapped = picker.pool_settings.mapped_model
+            if model_name == pool_mapped:
+                return (RequestCategory.POOL, model_name, None)
+
+    # 4. Legacy ProviderRegistry path (for any other mapped models)
     if model_name:
         match = registry.find_provider_for_model(model_name)
         if match:
             provider, target_model = match
             return (RequestCategory.PROVIDER, model_name, target_model)
 
-    # 4. Everything else → pass through to Google
+    # 5. Everything else -> pass through to Google
     return (RequestCategory.PASSTHROUGH, model_name, None)
 
 
@@ -145,7 +159,7 @@ async def route_request(
     category, model_name, target_model = classify_request(path, body, registry)
 
     # ------------------------------------------------------------------
-    # 1. TELEMETRY — mock and swallow
+    # 1. TELEMETRY -- mock and swallow
     # ------------------------------------------------------------------
     if category is RequestCategory.TELEMETRY:
         log.debug(f"[TELEM] {method} {path}")
@@ -154,7 +168,41 @@ async def route_request(
         return (200, {"Content-Type": "application/json"}, b"{}")
 
     # ------------------------------------------------------------------
-    # 2. PROVIDER — mapped model → streaming provider pipeline
+    # 2. POOL -- pool-managed model -> full pool handler pipeline
+    # ------------------------------------------------------------------
+    if category is RequestCategory.POOL:
+        from src.pool.picker import get_picker
+        from src.pool.handler import handle_pool_request
+
+        picker = get_picker()
+        assert picker is not None  # guaranteed by classify_request
+
+        log.info(
+            f"[POOL] {method} {path} | "
+            f"{model_name} -> pool ({len(picker.entries)} entries)"
+        )
+
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        return (
+            200,
+            sse_headers,
+            handle_pool_request(
+                method=method,
+                path=path,
+                headers=headers,
+                body=body,
+                picker=picker,
+                upstream_hosts=upstream_hosts,
+                include_thoughts=include_thoughts,
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 3. PROVIDER -- legacy ProviderRegistry path (non-pool mapped models)
     # ------------------------------------------------------------------
     if category is RequestCategory.PROVIDER:
         assert model_name is not None
@@ -183,7 +231,7 @@ async def route_request(
         )
 
     # ------------------------------------------------------------------
-    # 3. PASSTHROUGH — forward to Google verbatim
+    # 4. PASSTHROUGH -- forward to Google verbatim
     # ------------------------------------------------------------------
     model_tag = f" | model={model_name}" if model_name else ""
     log.info(f"[PASS] {method} {path}{model_tag}")
