@@ -174,48 +174,81 @@ async def _handle_all_cooled(
                 f"Forwarding with original model."
             )
 
-    status, resp_headers, resp_body = await forward_to_google(
-        method=method,
-        path=path,
-        headers=headers,
-        body=body,
-        upstream_hosts=upstream_hosts,
-    )
+    # Stream the fallback response to the IDE without buffering.
+    # forward_to_google() uses client.request() which buffers the ENTIRE body
+    # before returning. For a streaming SSE endpoint (?alt=sse) this means
+    # waiting for the full model response (~2MB, 35+ seconds) before the IDE
+    # receives a single byte — causing the "generating..." freeze.
+    #
+    # Instead we use client.stream() so chunks flow to the IDE immediately
+    # as Google sends them, giving the same live streaming feel as the pool path.
+    import httpx as _httpx
+    from src.proxy.forwarder import _get_client, _build_forward_headers
 
-    if status >= 400:
-        # Google returned an error — wrap it as a Gemini SSE error event
-        # so the IDE gets a well-formed stream instead of raw error bytes.
-        # Raw non-SSE bytes on a streaming endpoint cause "agent execution
-        # terminated" and trigger the IDE's automatic retry, burning more pool
-        # entries unnecessarily.
+    fwd_headers = _build_forward_headers(headers)
+    client = _get_client()
+    last_error = ""
+
+    from src.proxy.forwarder import _SKIP_REQUEST_HEADERS  # already imported above
+
+    for host in upstream_hosts:
+        target_url = f"https://{host}{path}"
         try:
-            err_text = resp_body.decode("utf-8", errors="replace")[:300]
-        except Exception:
-            err_text = f"HTTP {status}"
+            async with client.stream(
+                method=method,
+                url=target_url,
+                headers=fwd_headers,
+                content=body,
+            ) as resp:
+                _log.info(
+                    f"[POOL] Fallback streaming from Google: {host} | {resp.status_code}"
+                )
+                if resp.status_code >= 400:
+                    err_body = await resp.aread()
+                    err_text = err_body.decode("utf-8", errors="replace")[:300]
+                    _log.warning(
+                        f"[POOL] Fallback Google returned {resp.status_code}: {err_text[:120]}"
+                    )
+                    error_event = json.dumps({
+                        "response": {
+                            "candidates": [{
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": f"[Proxy] All pool entries unavailable. "
+                                                       f"Fallback error {resp.status_code}: {err_text}"}]
+                                },
+                                "finishReason": "STOP",
+                            }],
+                            "modelVersion": fallback,
+                        }
+                    })
+                    yield f"data: {error_event}\n\n".encode("utf-8")
+                    await asyncio.sleep(0.05)
+                    return
+                # Stream success — yield chunks as they arrive
+                async for chunk in resp.aiter_bytes(chunk_size=4096):
+                    if chunk:
+                        yield chunk
+                return  # done
+        except (_httpx.TimeoutException, _httpx.ConnectError, _httpx.RequestError) as exc:
+            last_error = f"{host}: {exc}"
+            _log.warning(f"[POOL] Fallback: {host} failed ({exc}), trying next host")
+            continue
 
-        _log.warning(
-            f"[POOL] Fallback Google request returned {status}: {err_text[:120]}"
-        )
-        error_event = json.dumps({
-            "response": {
-                "candidates": [{
-                    "content": {
-                        "role": "model",
-                        "parts": [{"text": f"[Proxy] All pool entries unavailable. "
-                                           f"Fallback error {status}: {err_text}"}]
-                    },
-                    "finishReason": "STOP",
-                }],
-                "modelVersion": fallback,
-            }
-        })
-        yield f"data: {error_event}\n\n".encode("utf-8")
-        # One event-loop yield so the IOCP transport flushes before close
-        await asyncio.sleep(0.05)
-    else:
-        # Success — yield the raw Gemini SSE body from Google as-is
-        yield resp_body
-        await asyncio.sleep(0.05)
+    # All hosts failed
+    _log.error(f"[POOL] Fallback: all upstream hosts failed. Last: {last_error}")
+    error_event = json.dumps({
+        "response": {
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": f"[Proxy] All pool entries unavailable and all upstream hosts failed."}]},
+                "finishReason": "STOP",
+            }],
+            "modelVersion": fallback,
+        }
+    })
+    yield f"data: {error_event}\n\n".encode("utf-8")
+    await asyncio.sleep(0.05)
+
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +359,11 @@ async def handle_pool_request(
 
         openai_body["stream"] = True
         openai_body = _inject_thinking(openai_body, entry)
-        openai_body["max_tokens"] = entry.usable_tokens
+        # max_tokens is NOT overridden here. usable_tokens is the context window
+        # we announce to the IDE via FAMS — not the per-request output limit.
+        # The Gemini->OpenAI converter maps generationConfig.maxOutputTokens from
+        # the IDE request. Overriding with usable_tokens (e.g. 188808) causes
+        # input + output to exceed the provider's total context limit (HTTP 400).
 
         # ── Build provider shim ───────────────────────────────────────────
         provider_shim = Provider(

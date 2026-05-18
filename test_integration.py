@@ -198,17 +198,22 @@ assert_true("thinking" not in result_sf, "SF: no OpenCode 'thinking' field leake
 
 
 # =============================================================================
-# SECTION 7: max_tokens injection matches usable_tokens
+# SECTION 7: usable_tokens is sane (context window - safety buffer)
 # =============================================================================
-section("SECTION 7 — max_tokens set to usable_tokens in converted request")
+section("SECTION 7 — usable_tokens sanity (context window announcement only)")
 
-# We test the logic that would run inside handle_pool_request:
-# openai_body["max_tokens"] = entry.usable_tokens
+# usable_tokens is used ONLY for FAMS context window announcement.
+# It is NOT injected as max_tokens into API requests (doing so caused HTTP 400
+# because input + usable_tokens exceeded total context limit).
 for e in picker.entries:
-    body = {"model": e.model, "messages": [], "stream": True}
-    body["max_tokens"] = e.usable_tokens
-    assert_eq(body["max_tokens"], e.usable_tokens,
-              f"[{e.id}] max_tokens={e.usable_tokens} correctly set")
+    assert_true(
+        isinstance(e.usable_tokens, int) and e.usable_tokens > 0,
+        f"[{e.id}] usable_tokens={e.usable_tokens} is positive int"
+    )
+    assert_eq(
+        e.usable_tokens, e.context_window - e.safety_buffer_tokens,
+        f"[{e.id}] usable_tokens = context_window - safety_buffer"
+    )
 
 
 # =============================================================================
