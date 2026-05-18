@@ -101,7 +101,7 @@ POOL_TRIGGER_INJECT = (
     "});"
     "_w.on('error',()=>{global.__agProxyWatcher=null;});"
     "global.__agProxyWatcher=_w;"
-    "}catch(_e){}}}"
+    "}catch(_e){}}"
     "})()"
 )
 
