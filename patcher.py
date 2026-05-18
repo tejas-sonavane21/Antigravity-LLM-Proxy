@@ -67,48 +67,48 @@ URL_PATTERN = re.compile(
 # Regex for reading the current patched target from status check
 PATCHED_URL_PATTERN = re.compile(r"https?://127\.0\.0\.1:(\d+)")
 
-# ---------------------------------------------------------------------------
-# Pool Trigger Patch
-# ---------------------------------------------------------------------------
 
 # Exact string that ends AntigravityAuthMainService.M() in main.js.
-# Confirmed by grep: single occurrence at char offset ~11,561,180.
-# The method body is fully minified onto one line; this tail is unique.
-#
-# CRITICAL: We target the INTERIOR of M() — specifically the last statement
-# before the closing `}`. The IIFE must be injected INSIDE M(), not after it.
-#
-# WHY: The `}` closes the `M()` method. After a method in a class body, the
-# parser expects only another method definition or the class closing `}`. An
-# expression statement like `;(()=>{})()` appended AFTER the `}` would be
-# placed inside the class body — which is illegal ES syntax and causes:
-#   SyntaxError: Unexpected token '('
-#
-# CORRECT injection point: replace the closing `}` of M() with:
-#   ;(()=>{...IIFE...})()\ }    <-- IIFE runs inside M(), then M() closes
-#
-# This also fixes the `this` context: as an arrow function IIFE inside M(),
-# it captures M()'s `this` (the AntigravityAuthMainService instance).
-# The request handler `async(req,res)=>{}` is also an arrow, so it inherits
-# the same `this` — meaning `this.n` and `this.refreshUserStatus` work.
+# Confirmed unique occurrence at ~char 11,561,180.
+# IIFE is injected INSIDE M() so arrow function captures `this` (the service).
 POOL_TRIGGER_TARGET = "this.r=setInterval(t,xTa)}"
 
-# IIFE injected INSIDE M() before its closing `}`. Replaces the full target
-# string (including the `}`) with: <setInterval>;(()=>{...IIFE...})()}
-# So the replacement = IIFE body + M()'s closing }
-POOL_TRIGGER_INJECT = ";(()=>{if(!global.__agProxyTriggerServer){const _h=require('http'),_s=_h.createServer(async(req,res)=>{if(req.url==='/refresh-models'&&req.method==='GET'){try{const n=(await this.n).get(),a=R6(n);if(a)await this.refreshUserStatus(a);res.writeHead(200);res.end('ok')}catch(e){res.writeHead(500);res.end(e.message)}}else{res.writeHead(404);res.end()}});_s.listen(9528,'127.0.0.1');global.__agProxyTriggerServer=_s}})()"
+# Flag file path placeholder — replaced by do_pool_trigger_patch() at patch time.
+# The actual path (e.g. D:\\...\\scratchpad\\ag_proxy_refresh.flag) is embedded
+# as a JS string literal so the Node.js watcher knows exactly where to look.
+_FLAG_PATH_PLACEHOLDER = "__FLAG_PATH_PLACEHOLDER__"
 
-# The replacement string: POOL_TRIGGER_TARGET (minus its closing `}`) + IIFE + `}`
-# i.e.: 'this.r=setInterval(t,xTa)' + IIFE + '}'
-# This keeps the IIFE INSIDE M() and the `}` still closes M() correctly.
-POOL_TRIGGER_REPLACEMENT = (
-    POOL_TRIGGER_TARGET[:-1]  # strip the closing }
-    + POOL_TRIGGER_INJECT     # IIFE as last statement in M()
-    + "}"                     # M()'s closing } — now after the IIFE
+# fs.watch()-based IIFE injected inside M():
+# - Debounce guard (_b) prevents double-trigger from NTFS multiple change events
+# - Reads "1" → writes "0" back → calls refreshUserStatus() (same pattern as
+#   the existing t() interval function inside M())
+# - global.__agProxyWatcher sentinel prevents re-registration if M() reruns
+POOL_TRIGGER_INJECT = (
+    ";(()=>{if(!global.__agProxyWatcher){"
+    "const _fs=require('fs'),_fp=" + repr(_FLAG_PATH_PLACEHOLDER) + ",_b={v:false};"
+    "try{const _w=_fs.watch(_fp,async(evt)=>{"
+    "if(evt!=='change'||_b.v)return;"
+    "_b.v=true;"
+    "try{"
+    "const _v=_fs.readFileSync(_fp,'utf8').trim();"
+    "if(_v==='1'){"
+    "_fs.writeFileSync(_fp,'0');"
+    "const _n=(await this.n).get(),_a=R6(_n);"
+    "if(_a)await this.refreshUserStatus(_a);"
+    "}"
+    "}catch(_e){}"
+    "finally{_b.v=false;}"
+    "});"
+    "_w.on('error',()=>{global.__agProxyWatcher=null;});"
+    "global.__agProxyWatcher=_w;"
+    "}catch(_e){}}}"
+    "})()"
 )
 
 # Sentinel to detect whether the pool trigger is already applied
-POOL_TRIGGER_SENTINEL = "__agProxyTriggerServer"
+POOL_TRIGGER_SENTINEL = "__agProxyWatcher"
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -414,13 +414,18 @@ def do_status(ide_path: str) -> None:
 
 def do_pool_trigger_patch(ide_path: str) -> None:
     """
-    Inject the HTTP refresh trigger into AntigravityAuthMainService.M() in main.js.
+    Inject the fs.watch()-based refresh trigger into AntigravityAuthMainService.M()
+    in main.js.
 
-    The trigger is a self-invoking anonymous function appended to the end of M(),
-    right after 'this.r=setInterval(t,xTa)'. It starts a minimal Node.js HTTP server
-    on 127.0.0.1:9528 that, when called with GET /refresh-models, invokes
-    refreshUserStatus() — causing Antigravity to make a fresh fetchAvailableModels
-    request that our proxy can intercept and patch with the next pool entry's context.
+    The trigger is an arrow-function IIFE appended to the end of M(), right after
+    'this.r=setInterval(t,xTa)'. It sets up a Node.js fs.watch() on the shared
+    ag_proxy_refresh.flag file. When the proxy writes "1" to that file, the watcher
+    fires, reads "1", writes "0" back, and calls refreshUserStatus() — causing
+    Antigravity to make a fresh fetchAvailableModels request that our proxy
+    intercepts and patches with the next pool entry's context window.
+
+    The flag file path is read from config.json (patcher.flag_file) and embedded
+    as a string literal in the injected JS code at patch time.
 
     Target method (minified, single line in main.js):
         M(){this.r&&clearInterval(this.r);const t=async()=>{...};t(),this.r=setInterval(t,xTa)}
@@ -429,8 +434,26 @@ def do_pool_trigger_patch(ide_path: str) -> None:
     """
     main_js = Path(ide_path) / "main.js"
 
-    print(f"\n[POOL-TRIGGER] IDE path: {ide_path}")
-    print(f"[POOL-TRIGGER] Target  : {main_js}")
+    # Read flag_file path from config.json (required for this patch)
+    config_path = Path(__file__).parent / "config.json"
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            _cfg = json.load(f)
+        flag_file = _cfg.get("patcher", {}).get("flag_file", "")
+    except (OSError, json.JSONDecodeError) as e:
+        _error(f"Could not read config.json: {e}")
+        return  # unreachable — _error exits
+
+    if not flag_file:
+        _error(
+            "patcher.flag_file is not set in config.json.\n"
+            "Add a 'flag_file' entry under the 'patcher' section, e.g.:\n"
+            '  "flag_file": "D:\\\\Anti_Projects\\\\...\\\\scratchpad\\\\ag_proxy_refresh.flag"'
+        )
+
+    print(f"\n[POOL-TRIGGER] IDE path : {ide_path}")
+    print(f"[POOL-TRIGGER] Target   : {main_js}")
+    print(f"[POOL-TRIGGER] Flag file: {flag_file}")
     print()
 
     if not main_js.exists():
@@ -465,20 +488,25 @@ def do_pool_trigger_patch(ide_path: str) -> None:
             f"Manual inspection of main.js required."
         )
 
-    # Inject: strip the closing `}` from the target, append the IIFE as the
-    # last statement inside M(), then re-add the closing `}` that closes M().
-    #
-    # Result structure:
-    #   M(){...this.r=setInterval(t,xTa);(()=>{...IIFE...})()}  <-- valid
-    #                                                       ^^^^
-    #                              IIFE runs inside M()  /  M() closes
-    #
-    # If we had appended AFTER the `}` instead, the IIFE would land in the
-    # ES class body — which only allows method definitions, not expression
-    # statements — producing SyntaxError: Unexpected token '('.
+    # Build the final injection with the real flag file path embedded.
+    # flag_file from config.json has real single backslashes: D:\path\to\file
+    # In a JS single-quoted string literal each \ must be written as \\
+    # POOL_TRIGGER_INJECT contains the placeholder already quoted as:
+    #   repr(_FLAG_PATH_PLACEHOLDER) == "'__FLAG_PATH_PLACEHOLDER__'"
+    # We replace that exact token with a properly JS-escaped single-quoted path.
+    js_flag_path = "'" + flag_file.replace("\\", "\\\\") + "'"
+    final_inject = POOL_TRIGGER_INJECT.replace(repr(_FLAG_PATH_PLACEHOLDER), js_flag_path)
+
+    # Build replacement: target without closing `}` + IIFE + `}` closes M()
+    pool_trigger_replacement = (
+        POOL_TRIGGER_TARGET[:-1]   # strip the closing } of M()
+        + final_inject             # IIFE as last statement inside M()
+        + "}"                      # M()'s closing } — after the IIFE
+    )
+
     patched = content.replace(
         POOL_TRIGGER_TARGET,
-        POOL_TRIGGER_REPLACEMENT,
+        pool_trigger_replacement,
         1,  # replace only the first (and only) occurrence
     )
 
@@ -492,12 +520,15 @@ def do_pool_trigger_patch(ide_path: str) -> None:
             f"Make sure Antigravity IDE is fully closed and retry."
         )
 
-    print("  [INJECTED] Pool trigger HTTP server injected into main.js.")
+    print("  [INJECTED] Pool trigger (fs.watch) injected into main.js.")
     print("             Restart Antigravity IDE for the patch to take effect.")
     print()
-    print("  Trigger endpoint: GET http://127.0.0.1:9528/refresh-models")
-    print("  What it does    : Forces Antigravity to call refreshUserStatus(),")
-    print("                    which triggers a fresh fetchAvailableModels request.")
+    print(f"  Signal file : {flag_file}")
+    print(f"  How it works: Python proxy writes '1' to flag file")
+    print(f"                → fs.watch fires in main.js (<10ms)")
+    print(f"                → main.js calls refreshUserStatus()")
+    print(f"                → IDE makes fetchAvailableModels request")
+    print(f"                → Proxy intercepts, serves cached+patched response")
     print()
 
 

@@ -72,7 +72,8 @@ class ProviderConfig:
 @dataclass
 class PatcherConfig:
     target_url: str         # e.g. "https://127.0.0.1:9527"
-    ide_path: str | None = None  # optional override for IDE install location
+    ide_path: str | None = None   # optional override for IDE install location
+    flag_file: str | None = None  # path to ag_proxy_refresh.flag signal file
 
 
 @dataclass
@@ -106,6 +107,7 @@ class PoolSettings:
                                    # e.g. "claude-sonnet-4-6"
     mapped_model: str              # the IDE model name we intercept, e.g. "gpt-oss-120b-medium"
     fallback_limits: FallbackModelLimits = None  # real limits of fallback model
+    flag_file: str | None = None   # path to ag_proxy_refresh.flag (from patcher config)
 
     def __post_init__(self):
         if self.fallback_limits is None:
@@ -289,6 +291,7 @@ def _parse_config(raw: dict) -> AppConfig:
     patcher = PatcherConfig(
         target_url=patcher_raw["target_url"],
         ide_path=patcher_raw.get("ide_path"),     # optional field
+        flag_file=patcher_raw.get("flag_file"),   # optional signal file path
     )
 
     # --- model_pool (optional) ---
@@ -314,6 +317,7 @@ def _parse_config(raw: dict) -> AppConfig:
             all_cooled_fallback=str(ps.get("all_cooled_fallback", "passthrough")),
             mapped_model=str(raw_model_pool.get("mapped_model", "gpt-oss-120b-medium")),
             fallback_limits=fallback_limits,
+            flag_file=patcher_raw.get("flag_file"),  # threaded from patcher section
         )
 
     return AppConfig(

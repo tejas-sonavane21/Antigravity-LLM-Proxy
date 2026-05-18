@@ -243,6 +243,11 @@ def main() -> None:
             log.error(f"Pool initialization failed: {exc}")
             log.error("Check model_pool.entries in config.json.")
             sys.exit(1)
+
+        # --- Initialize on-demand refresh flag file ---
+        from src.pool.trigger import init_flag_file
+        init_flag_file(config.pool_settings.flag_file)
+
     else:
         log.info("Model pool not configured — pool routing disabled.")
 

@@ -334,7 +334,7 @@ async def handle_pool_request(
 
         # ── Fire-and-forget trigger (only on first attempt) ───────────────
         if pool_attempt == 1:
-            asyncio.create_task(trigger_model_refresh())
+            asyncio.create_task(trigger_model_refresh(picker.pool_settings.flag_file))
             picker.pending_advance = True
 
         # ── Convert Gemini -> OpenAI ──────────────────────────────────────
