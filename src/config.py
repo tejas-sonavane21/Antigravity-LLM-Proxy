@@ -76,6 +76,26 @@ class PatcherConfig:
 
 
 @dataclass
+class FallbackModelLimits:
+    """
+    Actual capability limits for the all_cooled_fallback model.
+    Used by _handle_all_cooled() to patch the Gemini request body fields
+    (maxOutputTokens, thinkingBudget) so they match the fallback model's real
+    limits before forwarding to Google.
+
+    Why needed: FAMS announces pool entry usable_tokens (e.g. 188808) as the
+    mapped model's maxTokens. The IDE includes that value as
+    generationConfig.maxOutputTokens in subsequent requests. When the fallback
+    model has a lower limit (e.g. claude-sonnet-4-6 = 64000 maxOutputTokens),
+    Google rejects the request with 500.
+
+    Lives at config.json `model_pool.pool_settings.fallback_model_limits`.
+    """
+    max_output_tokens: int | None = None   # e.g. 64000 for claude-sonnet-4-6
+    thinking_budget:   int | None = None   # e.g. 1024  for claude-sonnet-4-6
+
+
+@dataclass
 class PoolSettings:
     """
     Global settings that apply to the entire model pool.
@@ -85,6 +105,11 @@ class PoolSettings:
     all_cooled_fallback: str       # "passthrough" OR a specific model name string
                                    # e.g. "claude-sonnet-4-6"
     mapped_model: str              # the IDE model name we intercept, e.g. "gpt-oss-120b-medium"
+    fallback_limits: FallbackModelLimits = None  # real limits of fallback model
+
+    def __post_init__(self):
+        if self.fallback_limits is None:
+            self.fallback_limits = FallbackModelLimits()
 
 
 @dataclass
@@ -271,10 +296,24 @@ def _parse_config(raw: dict) -> AppConfig:
     raw_model_pool: dict | None = raw.get("model_pool")
     if raw_model_pool is not None:
         ps = raw_model_pool.get("pool_settings", {})
+        fb_raw = ps.get("fallback_model_limits", {})
+        fallback_limits = FallbackModelLimits(
+            max_output_tokens=(
+                int(fb_raw["max_output_tokens"])
+                if fb_raw.get("max_output_tokens") is not None
+                else None
+            ),
+            thinking_budget=(
+                int(fb_raw["thinking_budget"])
+                if fb_raw.get("thinking_budget") is not None
+                else None
+            ),
+        )
         pool_settings = PoolSettings(
             safety_buffer_tokens=int(ps.get("safety_buffer_tokens", 8192)),
             all_cooled_fallback=str(ps.get("all_cooled_fallback", "passthrough")),
             mapped_model=str(raw_model_pool.get("mapped_model", "gpt-oss-120b-medium")),
+            fallback_limits=fallback_limits,
         )
 
     return AppConfig(

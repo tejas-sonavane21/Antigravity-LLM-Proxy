@@ -36,6 +36,11 @@ _COOLDOWN_TPM_S  = 120    # per-minute token limit
 _COOLDOWN_5XX_S  = 30     # generic 5xx server error
 _COOLDOWN_503_S  = 90     # overloaded / service unavailable
 _COOLDOWN_DEFAULT_429_S = 120  # unknown 429 sub-type → conservative fallback
+# Permanent 4xx errors (401 invalid key/model, 403 forbidden, 400 bad request):
+# These are configuration or model-level failures that won't self-resolve in
+# 30 seconds. Use a 1-hour cooldown so the entry is parked for the session
+# while other entries handle requests. The operator should fix the config.
+_COOLDOWN_PERM_4XX_S = 3600  # 1 hour
 
 
 # ---------------------------------------------------------------------------
@@ -164,10 +169,14 @@ def resolve_cooldown(
         cooldown_until = now + timedelta(seconds=_COOLDOWN_5XX_S)
         reason = f"{http_status}: Server error ({_COOLDOWN_5XX_S}s cooldown)"
     else:
-        # Non-retryable error (4xx except 429) — short cooldown to avoid
-        # hammering a broken key but don't lock it out permanently
-        cooldown_until = now + timedelta(seconds=_COOLDOWN_5XX_S)
-        reason = f"{http_status}: Unexpected error ({_COOLDOWN_5XX_S}s cooldown)"
+        # Permanent 4xx (401, 403, 400, 404 ...) — these are configuration or
+        # model-level failures. 401 "model not supported" won't fix itself in
+        # 30s; park the entry for 1 hour so other entries handle traffic.
+        cooldown_until = now + timedelta(seconds=_COOLDOWN_PERM_4XX_S)
+        reason = (
+            f"{http_status}: Permanent error "
+            f"({_COOLDOWN_PERM_4XX_S // 3600}h cooldown — check model/key config)"
+        )
 
     _log.warning(
         f"  [{entry_id}] Cooldown applied: {reason} → "

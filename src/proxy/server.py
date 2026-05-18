@@ -8,35 +8,29 @@ to the router and handles the two response types:
   - bytes body  -> fastapi.responses.Response  (TELEMETRY / PASSTHROUGH)
   - AsyncIterator[bytes] -> fastapi.responses.StreamingResponse  (POOL/PROVIDER)
 
-Enterprise-grade streaming:
+Streaming behaviour (Windows IOCP note):
   The IDE requires each SSE chunk to be flushed to the TCP socket immediately.
-  Uvicorn's h11 transport batches write() calls into a single kernel send when
-  the event loop is idle — meaning all chunks may be held in the OS write buffer
-  until the connection closes or Ctrl-C is pressed (the bug observed on Windows).
+  On Linux, asyncio.sleep(0) reliably drains the selector write buffer.
+  On Windows with IocpProactor, sleep(0) is NOT sufficient — the IOCP
+  completion port processes with timeout=0 finds no pending I/O and returns
+  immediately, leaving data sitting in the kernel write buffer until the
+  connection closes (manifests as the Ctrl+C burst-flush symptom).
 
-  Fix: wrap every AsyncIterator in _flush_after_each_chunk(), which inserts
-  `await asyncio.sleep(0)` after each yielded chunk. This single event-loop
-  yield forces the asyncio selector/IOCP to drain the h11 write buffer before
-  processing the next chunk. This is the standard pattern for SSE proxies.
+  The correct fix for Windows IOCP is the queue-based approach already
+  implemented in openai_compat._iter_stream_events:
+    - A background asyncio.Task reads SSE lines into an asyncio.Queue
+    - The generator does asyncio.wait_for(queue.get(), timeout=25)
+    - wait_for() runs the event loop with a REAL timeout, giving IOCP
+      enough time to process all pending overlapped write completions
+    - Each yield therefore arrives at the IDE within milliseconds
 
-  Why asyncio.sleep(0) works:
-    - h11 calls transport.write(data) — this enqueues data into asyncio's
-      write buffer, but does NOT send it yet.
-    - When we yield to the event loop (via sleep(0)), asyncio's selector runs
-      and calls the socket's send() on all pending write buffers.
-    - The IDE receives each SSE line within milliseconds of the provider
-      emitting it, instead of in a burst when the stream ends.
+  This server.py file intentionally does NOT add any extra wrapping or
+  sleep() calls. The streaming generators from handler.py and openai_compat.py
+  already contain the correct IOCP-compatible flush logic.
 
-  The previous `await asyncio.sleep(0.05)` in openai_compat.py only flushed
-  after the FINAL event. This fix flushes after EVERY chunk — true incremental
-  delivery. The existing per-final-event sleeps in openai_compat.py are kept
-  as-is (they serve a different purpose: IOCP drain for the close signal).
-
-  Why this doesn't break the chat UI burst fix:
-    The queue-based line reader in openai_compat._iter_stream_events uses
-    asyncio.Queue + asyncio.wait_for() for safe timeout/keepalive handling.
-    sleep(0) between chunks does not affect that — it only adds one extra
-    event-loop tick per yielded Gemini SSE frame.
+  Background: the previous _flush_after_each_chunk() wrapper using sleep(0)
+  was reverted because it re-introduced the exact buffering bug it was meant
+  to fix — on Windows IOCP, sleep(0) has no write-flushing effect.
 
 Usage::
 
@@ -46,7 +40,6 @@ Usage::
     uvicorn.run(app, ...)
 """
 
-import asyncio
 import logging
 from collections.abc import AsyncIterator
 
@@ -58,40 +51,6 @@ from src.proxy.router import route_request
 
 log = logging.getLogger("proxy.server")
 
-
-# ---------------------------------------------------------------------------
-# Streaming flush wrapper
-# ---------------------------------------------------------------------------
-
-async def _flush_after_each_chunk(
-    source: AsyncIterator[bytes],
-) -> AsyncIterator[bytes]:
-    """
-    Wrap an async generator so that after every yielded chunk, control is
-    returned to the asyncio event loop for one cycle (asyncio.sleep(0)).
-
-    This forces uvicorn's h11 transport to drain its write buffer to the
-    kernel TCP socket immediately, giving the IDE per-token streaming instead
-    of burst delivery at stream end.
-
-    Preserves the original generator's exception behaviour:
-      - GeneratorExit from StreamingResponse.body_iterator close() propagates
-        cleanly via try/finally.
-      - Any exception from source propagates to FastAPI's exception handler.
-    """
-    try:
-        async for chunk in source:
-            yield chunk
-            # One event-loop tick: force asyncio to flush the h11 write buffer.
-            # Cost: ~0.001ms per chunk. Benefit: true incremental SSE delivery.
-            await asyncio.sleep(0)
-    except GeneratorExit:
-        pass  # Client disconnected — clean shutdown
-
-
-# ---------------------------------------------------------------------------
-# App factory
-# ---------------------------------------------------------------------------
 
 def create_app(
     registry: ProviderRegistry,
@@ -132,9 +91,10 @@ def create_app(
         with query string, then delegates to the router.
 
         For POOL/PROVIDER requests the router returns an AsyncIterator[bytes],
-        which we wrap in _flush_after_each_chunk() and then StreamingResponse
-        so the IDE receives each SSE chunk immediately rather than waiting
-        for the full buffered body.
+        which we wrap in StreamingResponse so the IDE receives SSE data
+        as it arrives. The generators from handler.py/openai_compat.py
+        already implement Windows IOCP-compatible write flushing internally
+        via their queue + wait_for pattern (no extra wrapping needed here).
         """
         body = await request.body()
 
@@ -157,11 +117,13 @@ def create_app(
             include_thoughts=include_thoughts,
         )
 
-        # POOL/PROVIDER route returns AsyncIterator[bytes] — wrap in the flush
-        # adapter so uvicorn drains the write buffer after every SSE chunk.
+        # POOL/PROVIDER route returns AsyncIterator[bytes] — use StreamingResponse
+        # so uvicorn delivers each SSE chunk to the IDE as it is yielded.
+        # No additional wrapping: the generator's internal queue+wait_for loop
+        # already ensures IOCP write buffers are drained between chunks.
         if isinstance(resp_body, AsyncIterator):
             return StreamingResponse(
-                content=_flush_after_each_chunk(resp_body),
+                content=resp_body,
                 status_code=status,
                 headers=resp_headers,
                 media_type="text/event-stream",
