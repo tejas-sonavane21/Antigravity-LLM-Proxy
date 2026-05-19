@@ -484,31 +484,63 @@ class PoolPicker:
     def _persist_cooldown_state(self) -> None:
         """
         Write all current cooldown_until / cooldown_reason values back into
-        raw_config["model_pool"]["entries"] and flush config.json atomically.
+        config.json, updating ONLY those two fields per entry.
 
-        Only the cooldown fields are updated -- all other config fields remain
-        exactly as they were loaded (API keys, limits, model names unchanged).
+        IMPORTANT — Live re-read strategy:
+            We re-read config.json from disk immediately before writing instead
+            of using self.raw_config (which was loaded once at startup).
+            This prevents the "stale snapshot" bug: if the user edits config.json
+            while the proxy is running (thinking.enabled, new keys, pool_settings
+            changes), a naive write of the startup snapshot would silently
+            overwrite those edits. Re-reading ensures we only ever touch
+            cooldown_until / cooldown_reason, leaving everything else on disk
+            exactly as it is.
         """
-        raw_entries = self.raw_config.get("model_pool", {}).get("entries", [])
+        import json as _json
+        from pathlib import Path as _Path
 
-        # Build a lookup: entry_id -> raw dict for in-place update
+        abs_path = str(_Path(self.config_path).resolve())
+
+        # Re-read live config from disk
+        try:
+            live_raw = _json.loads(_Path(abs_path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            _log.error(
+                f"PoolPicker: Failed to re-read config.json before cooldown "
+                f"write: {exc}. Cooldown state NOT persisted."
+            )
+            return
+
+        # Validate structure before touching anything
+        missing = [s for s in _REQUIRED_SECTIONS if s not in live_raw]
+        if missing:
+            _log.error(
+                f"PoolPicker: Re-read config.json is missing sections "
+                f"{missing}. Cooldown state NOT persisted."
+            )
+            return
+
+        # Update ONLY cooldown fields in the live dict
+        raw_entries = live_raw.get("model_pool", {}).get("entries", [])
         raw_by_id: dict[str, dict] = {e.get("id"): e for e in raw_entries}
 
         for entry in self.entries:
             raw = raw_by_id.get(entry.id)
             if raw is None:
-                continue
-            if entry.cooldown_until is not None:
-                raw["cooldown_until"] = entry.cooldown_until.isoformat()
-            else:
-                raw["cooldown_until"] = None
+                continue  # entry added to config after startup — skip safely
+            raw["cooldown_until"] = (
+                entry.cooldown_until.isoformat()
+                if entry.cooldown_until is not None
+                else None
+            )
             raw["cooldown_reason"] = entry.cooldown_reason
 
+        # Keep in-memory reference current so next re-read sees a clean base
+        self.raw_config = live_raw
+
         try:
-            write_config_atomic(self.config_path, self.raw_config)
+            write_config_atomic(self.config_path, live_raw)
         except RuntimeError as exc:
-            # Log but don't crash -- in-memory state is correct.
-            # Next successful write will catch up.
             _log.error(
                 f"PoolPicker: Failed to persist cooldown state: {exc}. "
                 f"State is correct in memory but will be lost on restart."

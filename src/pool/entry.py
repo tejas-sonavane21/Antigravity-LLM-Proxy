@@ -95,6 +95,11 @@ class PoolEntry:
     # None = this entry does not support thinking / field unknown
     response_thinking_field: Optional[str]
 
+    # Optional: advertise this entry's max output tokens to the IDE via FAMS.
+    # When set, patch_model_metadata() will update the mapped model's
+    # maxOutputTokens field. When None, the field is left as Google returns it.
+    max_output_tokens: Optional[int] = None
+
     # Crash-safe cooldown state — persisted to config.json
     cooldown_until: Optional[datetime]    # UTC datetime when cooldown expires; None = not cooled
     cooldown_reason: Optional[str]        # human-readable reason, e.g. "429: TPM limit reached"

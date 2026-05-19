@@ -98,6 +98,11 @@ def parse_pool_entries(raw_pool: dict) -> tuple[list[PoolEntry], dict]:
             safety_buffer_tokens=safety,
             thinking=thinking,
             response_thinking_field=e.get("response_thinking_field"),
+            max_output_tokens=(
+                int(e["max_output_tokens"])
+                if e.get("max_output_tokens") is not None
+                else None
+            ),
             cooldown_until=cooldown_dt,
             cooldown_reason=e.get("cooldown_reason"),
             # Runtime state starts fresh every process launch

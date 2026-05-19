@@ -94,22 +94,35 @@ def patch_model_metadata(
     target = models[mapped_model]
     old_tokens = target.get("maxTokens", "?")
 
-    # maxTokens: advertise the pool entry's usable_tokens
-    # This is: context_window - safety_buffer_tokens
+    # maxTokens: advertise the pool entry's usable_tokens (context window for IDE)
     target["maxTokens"] = pool_entry.usable_tokens
 
-    # supportsThinking: all current pool models support thinking
-    target["supportsThinking"] = True
+    # supportsThinking: reflect the ACTUAL entry's thinking support.
+    # Previously hardcoded True — this broke non-thinking models (e.g. OpenRouter
+    # owl-alpha) because the IDE would inject thinkingConfig into every request,
+    # and the model would reject it with a tool-call failure.
+    target["supportsThinking"] = pool_entry.thinking.enabled
 
-    # thinkingBudget: use pool entry's configured budget if set
-    if pool_entry.thinking.budget is not None:
+    # thinkingBudget: use pool entry's configured budget if thinking is enabled
+    if pool_entry.thinking.enabled and pool_entry.thinking.budget is not None:
         target["thinkingBudget"] = pool_entry.thinking.budget
+
+    # maxOutputTokens: patch only when the entry has an explicit value configured.
+    # When None (most entries), leave Google's value untouched — the provider
+    # enforces its own output cap naturally.
+    old_output = target.get("maxOutputTokens", "?")
+    if pool_entry.max_output_tokens is not None:
+        target["maxOutputTokens"] = pool_entry.max_output_tokens
+        output_patch_msg = f" maxOutputTokens {old_output} -> {pool_entry.max_output_tokens}"
+    else:
+        output_patch_msg = ""
 
     _log.info(
         f"[PATCH] fetchAvailableModels: {mapped_model!r} "
         f"maxTokens {old_tokens} -> {pool_entry.usable_tokens} "
         f"(entry={pool_entry.id}, ctx={pool_entry.context_window}, "
         f"buffer={pool_entry.safety_buffer_tokens})"
+        f"{output_patch_msg}"
     )
 
     try:
