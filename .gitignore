@@ -42,6 +42,8 @@ ag_proxy/
 # Config
 config.json
 *.json
+scratchpad/
+scratchpad/*
 
 # test
 test_streaming_pipeline.py
