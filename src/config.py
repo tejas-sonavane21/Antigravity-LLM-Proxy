@@ -103,11 +103,11 @@ class PoolSettings:
     Lives at config.json `model_pool.pool_settings`.
     """
     safety_buffer_tokens: int      # default 8192 — subtracted from usable_tokens
-    all_cooled_fallback: str       # "passthrough" OR a specific model name string
-                                   # e.g. "claude-sonnet-4-6"
+    all_cooled_fallback: str       # "passthrough" | "keep-alive" | "<model-id>"
     mapped_model: str              # the IDE model name we intercept, e.g. "gpt-oss-120b-medium"
     fallback_limits: FallbackModelLimits = None  # real limits of fallback model
     flag_file: str | None = None   # path to ag_proxy_refresh.flag (from patcher config)
+    keep_alive_timeout_minutes: int = 10  # max minutes to wait in keep-alive mode before passthrough
 
     def __post_init__(self):
         if self.fallback_limits is None:
@@ -318,6 +318,7 @@ def _parse_config(raw: dict) -> AppConfig:
             mapped_model=str(raw_model_pool.get("mapped_model", "gpt-oss-120b-medium")),
             fallback_limits=fallback_limits,
             flag_file=patcher_raw.get("flag_file"),  # threaded from patcher section
+            keep_alive_timeout_minutes=int(ps.get("keep_alive_timeout_minutes", 10)),
         )
 
     return AppConfig(

@@ -99,7 +99,7 @@ _FINISH_REASON_MAP = {
 # tool-call argument generation) to prevent the IDE's HTTP keep-alive timer
 # from closing the connection (manifests as ConnectionResetError 10054 on
 # Windows after ~4 minutes of silence).
-_HEARTBEAT_INTERVAL: float = 25.0   # seconds between keepalive injections
+_HEARTBEAT_INTERVAL: float = 5.0    # seconds between keepalive injections
 _SSE_KEEPALIVE: bytes = b": keepalive\n\n"  # SSE comment — ignored by IDE parser
 
 

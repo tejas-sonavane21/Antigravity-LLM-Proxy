@@ -117,8 +117,68 @@ async def _handle_all_cooled(
     stream and show "agent execution terminated" without any useful context.
     """
     from src.proxy.forwarder import forward_to_google
+    from src.pool.picker import get_picker
 
     fallback = pool_settings.all_cooled_fallback
+
+    # ------------------------------------------------------------------
+    # "keep-alive" mode — wait for any pool entry to become available
+    # ------------------------------------------------------------------
+    if fallback == "keep-alive":
+        timeout_s = pool_settings.keep_alive_timeout_minutes * 60
+        poll_interval_s = 5.0
+        _SSE_KA = b": keepalive\n\n"
+
+        picker = get_picker()
+        eta = picker.earliest_cooldown_seconds() if picker else 0.0
+        eta_display = f"{eta:.0f}s" if eta > 0 else "unknown"
+
+        _log.warning(
+            f"[POOL] keep-alive: all entries cooled. "
+            f"Earliest key available in ~{eta_display}. "
+            f"Waiting up to {pool_settings.keep_alive_timeout_minutes}m "
+            f"(poll every {poll_interval_s:.0f}s)..."
+        )
+
+        waited_s: float = 0.0
+        while waited_s < timeout_s:
+            await asyncio.sleep(poll_interval_s)
+            waited_s += poll_interval_s
+
+            # Yield keepalive to keep IDE connection open
+            yield _SSE_KA
+
+            # Check if any entry is now available
+            if picker is not None:
+                entry = picker.pick()
+                if entry is not None:
+                    _log.info(
+                        f"[POOL] keep-alive: [{entry.id}] cooldown expired after "
+                        f"~{waited_s:.0f}s — resuming pool stream"
+                    )
+                    # Hand the picked entry back so handle_pool_request can
+                    # use it properly with full thinking injection and release().
+                    # We release it immediately (no error) so it goes back into
+                    # the pool, then return a special sentinel that handle_pool_request
+                    # detects to re-enter its pick() loop.
+                    #
+                    # Simpler approach: just stream through this entry directly here.
+                    picker.release(entry.id, 200, None)
+                    # Signal caller to retry: we yield nothing more and return.
+                    # The caller (handle_pool_request) will loop back and pick().
+                    return
+
+        # Timed out — fall through to passthrough
+        _log.warning(
+            f"[POOL] keep-alive: timed out after "
+            f"{pool_settings.keep_alive_timeout_minutes}m — "
+            f"falling through to passthrough"
+        )
+        fallback = "passthrough"
+
+    # ------------------------------------------------------------------
+    # Original fallback logic (passthrough or model substitution)
+    # ------------------------------------------------------------------
     _log.warning(
         f"[POOL] All pool entries cooled/disabled — "
         f"forwarding to Google with fallback model {fallback!r}"
@@ -293,11 +353,13 @@ async def handle_pool_request(
     )
 
     attempted_ids: set[str] = set()
+    pool_attempt = 0
 
-    for pool_attempt in range(1, _MAX_POOL_ATTEMPTS + 1):
+    while True:
 
         # ── pick() ────────────────────────────────────────────────────────
         entry = picker.pick()
+        pool_attempt += 1
 
         if entry is None:
             # All entries are cooled/disabled
@@ -305,11 +367,19 @@ async def handle_pool_request(
                 f"[POOL] pick() returned None after {pool_attempt - 1} "
                 f"pool attempt(s) -> all-cooled fallback"
             )
+            _got_data = False
             async for chunk in _handle_all_cooled(
                 method, path, headers, body, upstream_hosts, picker.pool_settings
             ):
+                _got_data = True
                 yield chunk
-            return
+            if _got_data:
+                return   # normal fallback finished streaming — done
+            # _got_data=False: keep-alive freed a key — retry pick() from top.
+            # Reset attempt counter and tried-set so we treat this as a fresh start.
+            attempted_ids.clear()
+            pool_attempt = 0
+            continue
 
         # Guard: don't re-attempt an entry we already tried this request
         if entry.id in attempted_ids:
@@ -317,11 +387,21 @@ async def handle_pool_request(
                 f"[POOL] pick() returned already-tried entry [{entry.id}] "
                 f"— no more distinct entries available, using fallback"
             )
+            _got_data = False
             async for chunk in _handle_all_cooled(
                 method, path, headers, body, upstream_hosts, picker.pool_settings
             ):
+                _got_data = True
                 yield chunk
-            return
+            if _got_data:
+                return
+            attempted_ids.clear()
+            pool_attempt = 0
+            continue
+
+        # Guard: max distinct pool entries tried in one request
+        if pool_attempt > _MAX_POOL_ATTEMPTS:
+            break
 
         attempted_ids.add(entry.id)
 

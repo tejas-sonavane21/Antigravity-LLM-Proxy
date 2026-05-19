@@ -288,6 +288,33 @@ class PoolPicker:
         return selected
 
     # ------------------------------------------------------------------
+    # earliest_cooldown_seconds() -- ETA for next key availability
+    # ------------------------------------------------------------------
+
+    def earliest_cooldown_seconds(self) -> float:
+        """
+        Return how many seconds until the soonest cooled entry becomes
+        available, or 0.0 if any entry is already available right now.
+
+        Used by the keep-alive wait loop to report accurate ETAs.
+        """
+        now = datetime.now(timezone.utc)
+        min_wait: float | None = None
+
+        for e in self.entries:
+            if not e.enabled:
+                continue
+            if not e.is_cooled:
+                return 0.0  # already available
+            if e.cooldown_until is not None:
+                remaining = (e.cooldown_until - now).total_seconds()
+                if remaining > 0:
+                    if min_wait is None or remaining < min_wait:
+                        min_wait = remaining
+
+        return min_wait if min_wait is not None else 0.0
+
+    # ------------------------------------------------------------------
     # release() -- called after request completes (success or error)
     # ------------------------------------------------------------------
 
