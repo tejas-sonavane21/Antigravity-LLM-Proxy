@@ -68,21 +68,31 @@ URL_PATTERN = re.compile(
 PATCHED_URL_PATTERN = re.compile(r"https?://127\.0\.0\.1:(\d+)")
 
 
-# Exact string that ends AntigravityAuthMainService.M() in main.js.
-# Confirmed unique occurrence at ~char 11,561,180.
-# IIFE is injected INSIDE M() so arrow function captures `this` (the service).
-POOL_TRIGGER_TARGET = "this.r=setInterval(t,xTa)}"
+# Exact string that ends _startUserStatusRefreshTimer() in the new main.js.
+# Confirmed unique occurrence at char 12,394,795 (new build, ~12.9MB file).
+# IIFE is injected INSIDE _startUserStatusRefreshTimer() so arrow function
+# captures `this` (the aGe / AntigravityAuthMainService instance).
+#
+# Variable name changes vs old build:
+#   Old: this.r=setInterval(t,xTa)}   (fully minified)
+#   New: this._userStatusRefreshTimer=setInterval(t,OOa)}  (less minified)
+#   Old: this.n  (oauthTokenObservable)  →  New: this._oauthTokenObservable
+#   Old: R6(...)  (token helper)          →  New: _5(...)
+POOL_TRIGGER_TARGET = "this._userStatusRefreshTimer=setInterval(t,OOa)}"
 
 # Flag file path placeholder — replaced by do_pool_trigger_patch() at patch time.
 # The actual path (e.g. D:\\...\\scratchpad\\ag_proxy_refresh.flag) is embedded
 # as a JS string literal so the Node.js watcher knows exactly where to look.
 _FLAG_PATH_PLACEHOLDER = "__FLAG_PATH_PLACEHOLDER__"
 
-# fs.watch()-based IIFE injected inside M():
+# fs.watch()-based IIFE injected inside _startUserStatusRefreshTimer():
 # - Debounce guard (_b) prevents double-trigger from NTFS multiple change events
 # - Reads "1" → writes "0" back → calls refreshUserStatus() (same pattern as
-#   the existing t() interval function inside M())
-# - global.__agProxyWatcher sentinel prevents re-registration if M() reruns
+#   the existing t() interval function inside _startUserStatusRefreshTimer())
+# - global.__agProxyWatcher sentinel prevents re-registration on re-runs
+# - Uses updated variable names from new build:
+#     this._oauthTokenObservable  (was this.n)
+#     _5(...)                     (was R6(...))
 POOL_TRIGGER_INJECT = (
     ";(()=>{if(!global.__agProxyWatcher){"
     "const _fs=require('fs'),_fp=" + repr(_FLAG_PATH_PLACEHOLDER) + ",_b={v:false};"
@@ -93,7 +103,7 @@ POOL_TRIGGER_INJECT = (
     "const _v=_fs.readFileSync(_fp,'utf8').trim();"
     "if(_v==='1'){"
     "_fs.writeFileSync(_fp,'0');"
-    "const _n=(await this.n).get(),_a=R6(_n);"
+    "const _n=(await this._oauthTokenObservable).get(),_a=_5(_n);"
     "if(_a)await this.refreshUserStatus(_a);"
     "}"
     "}catch(_e){}"
