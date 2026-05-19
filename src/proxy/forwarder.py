@@ -73,7 +73,13 @@ _SKIP_RESPONSE_HEADERS = frozenset({
 #   Setting 20s ensures we close connections before Google does.
 #
 # max_keepalive_connections = 10 — cap idle pool size (3 hosts × headroom)
+# Timeout for non-SSE buffered requests (loadCodeAssist, listExperiments, etc.)
 _TIMEOUT = httpx.Timeout(connect=10.0, read=55.0, write=10.0, pool=5.0)
+# Timeout for SSE streaming pass-through (claude-sonnet, gemini, etc.).
+# read= applies to each individual chunk read, NOT the total stream duration.
+# We set it to 120s so a model that pauses mid-generation doesn't time out,
+# while still catching truly dead connections.
+_TIMEOUT_SSE = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=5.0)
 _LIMITS = httpx.Limits(
     max_keepalive_connections=10,
     max_connections=20,
@@ -201,3 +207,100 @@ async def forward_to_google(
         {"Content-Type": "application/json"},
         f'{{"error":{{"message":"All upstream hosts failed: {last_error}","code":502}}}}'.encode(),
     )
+# ---------------------------------------------------------------------------
+# Streaming forward (SSE pass-through)
+# ---------------------------------------------------------------------------
+
+async def forward_to_google_stream(
+    method: str,
+    path: str,
+    headers: dict[str, str],
+    body: bytes,
+    upstream_hosts: list[str],
+):
+    """
+    Stream a pass-through SSE request to Google, yielding raw bytes as they
+    arrive without buffering the complete body first.
+
+    Used for `?alt=sse` pass-through requests (e.g. claude-sonnet-4-6,
+    gemini-3-flash when not pool-routed) so the IDE receives tokens in
+    real-time instead of waiting for the entire generation to complete.
+
+    Yields:
+        Raw bytes chunks from the Google SSE stream.
+
+    On connection failure: yields a Gemini-format SSE error event so the IDE
+    receives a well-formed response instead of a timeout.
+    """
+    from collections.abc import AsyncIterator
+    import json as _json
+
+    fwd_headers = _build_forward_headers(headers)
+    client = _get_client()
+
+    for host in upstream_hosts:
+        target_url = f"https://{host}{path}"
+        try:
+            async with client.stream(
+                method,
+                target_url,
+                headers=fwd_headers,
+                content=body,
+                timeout=_TIMEOUT_SSE,
+            ) as resp:
+                log.info(
+                    f"  → {host} | {resp.status_code} | SSE stream open"
+                )
+                if resp.status_code >= 400:
+                    # HTTP error — read body and return an SSE error event
+                    err_body = await resp.aread()
+                    log.warning(
+                        f"  → {host} | {resp.status_code} | "
+                        f"SSE pass-through error: {err_body[:200]}"
+                    )
+                    err_event = _json.dumps({
+                        "response": {
+                            "candidates": [{
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": (
+                                        f"[Proxy] Upstream error {resp.status_code}: "
+                                        f"{err_body[:200].decode('utf-8', errors='replace')}"
+                                    )}]
+                                },
+                                "finishReason": "STOP",
+                            }],
+                        }
+                    })
+                    yield f"data: {err_event}\n\n".encode("utf-8")
+                    return
+
+                # Stream bytes as they arrive
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        yield chunk
+                return  # done — don't try next host
+
+        except (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.RequestError,
+            httpx.PoolTimeout,
+        ) as exc:
+            log.warning(f"  → {host} | FAILED ({type(exc).__name__}: {exc})")
+            continue  # try next host
+
+    # All hosts exhausted
+    log.error("  All upstream hosts failed for SSE stream.")
+    err_event = _json.dumps({
+        "response": {
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "[Proxy] All upstream hosts failed."}]
+                },
+                "finishReason": "STOP",
+            }],
+        }
+    })
+    yield f"data: {err_event}\n\n".encode("utf-8")

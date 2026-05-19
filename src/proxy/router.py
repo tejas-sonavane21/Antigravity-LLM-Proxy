@@ -285,6 +285,31 @@ async def route_request(
     # ── Forward to Google ────────────────────────────────────────────────
     log.info(f"[PASS] {method} {path}{model_tag}")
 
+    # SSE streaming endpoints must be streamed, not buffered.
+    # Buffering a streamGenerateContent?alt=sse response means the IDE
+    # gets nothing until the ENTIRE model generation completes — this
+    # appears as a multi-minute hang for long responses (claude-sonnet, etc.)
+    _is_sse = "alt=sse" in path
+
+    if _is_sse:
+        from src.proxy.forwarder import forward_to_google_stream
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        return (
+            200,
+            sse_headers,
+            forward_to_google_stream(
+                method=method,
+                path=path,
+                headers=headers,
+                body=body,
+                upstream_hosts=upstream_hosts,
+            ),
+        )
+
     status, resp_headers, resp_body = await forward_to_google(
         method=method,
         path=path,
