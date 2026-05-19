@@ -3,7 +3,8 @@
     "host": "127.0.0.1",
     "port": 9527,
     "log_level": "DEBUG",
-    "include_thoughts": false
+    "include_thoughts": false,
+    "dump_model_responses": false
   },
   "upstream": {
     "hosts": [
@@ -23,15 +24,82 @@
       "base_url": "https://opencode.ai/zen/v1",
       "api_key": "YOUR_ZEN_API_KEY_HERE",
       "protocol": "openai",
-      "enabled": true,
+      "enabled": false,
+      "streaming": true,
       "model_map": {
-        "gemini-3.1-pro-low": "deepseek-v4-flash-free",
         "gpt-oss-120b-medium": "minimax-m2.5-free"
       }
     }
   ],
   "patcher": {
     "target_url": "https://127.0.0.1:9527",
-    "ide_path": "D:\\Anti_Gravity\\Antigravity\\resources\\app\\out"
+    "ide_path": "C:\\Path\\To\\Antigravity\\resources\\app\\out",
+    "flag_file": "C:\\Path\\To\\Antigravity_model_api_extension\\scratchpad\\ag_proxy_refresh.flag"
+  },
+  "model_pool": {
+    "mapped_model": "gpt-oss-120b-medium",
+    "pool_settings": {
+      "safety_buffer_tokens": 8192,
+      "all_cooled_fallback": "keep-alive",
+      "keep_alive_timeout_minutes": 10,
+      "fallback_model_limits": {
+        "max_output_tokens": 64000,
+        "thinking_budget": 1024
+      }
+    },
+    "entries": [
+      {
+        "id": "oc-key-1",
+        "label": "OpenCode MiniMax M2.5 Free (key 1)",
+        "base_url": "https://opencode.ai/zen/v1",
+        "api_key": "YOUR_OPENCODE_KEY_HERE",
+        "model": "minimax-m2.5-free",
+        "streaming": true,
+        "weight": 1,
+        "enabled": true,
+        "limits": {
+          "rpm": null,
+          "tpm": null,
+          "rpd": null
+        },
+        "context_window": 197000,
+        "safety_buffer_tokens": null,
+        "thinking": {
+          "enabled": true,
+          "budget": 4024,
+          "enable_param": "thinking",
+          "budget_param": "thinking_budget"
+        },
+        "response_thinking_field": "reasoning",
+        "cooldown_until": null,
+        "cooldown_reason": null
+      },
+      {
+        "id": "sf-key-1",
+        "label": "SiliconFlow Qwen3.5-397B-A17B (key 1)",
+        "base_url": "https://api.siliconflow.com/v1",
+        "api_key": "YOUR_SILICONFLOW_KEY_HERE",
+        "model": "Qwen/Qwen3.5-397B-A17B",
+        "streaming": true,
+        "weight": 1,
+        "enabled": true,
+        "limits": {
+          "rpm": 500,
+          "tpm": 2000000,
+          "rpd": null
+        },
+        "context_window": 262144,
+        "safety_buffer_tokens": null,
+        "thinking": {
+          "enabled": true,
+          "budget": 4024,
+          "enable_param": "enable_thinking",
+          "budget_param": "thinking_budget"
+        },
+        "response_thinking_field": "reasoning_content",
+        "cooldown_until": null,
+        "cooldown_reason": null
+      }
+    ]
   }
 }

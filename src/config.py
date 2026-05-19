@@ -137,19 +137,20 @@ _TEMPLATE = {
         "host": "127.0.0.1",
         "port": 9527,
         "log_level": "DEBUG",
-        "include_thoughts": False
+        "include_thoughts": False,
+        "dump_model_responses": False,
     },
     "upstream": {
         "hosts": [
             "daily-cloudcode-pa.sandbox.googleapis.com",
             "daily-cloudcode-pa.googleapis.com",
-            "cloudcode-pa.googleapis.com"
+            "cloudcode-pa.googleapis.com",
         ]
     },
     "tls": {
         "cert_dir": "./ag_proxy",
         "cert_file": "proxy-ca.crt",
-        "key_file": "proxy-ca.key"
+        "key_file": "proxy-ca.key",
     },
     "providers": [
         {
@@ -157,17 +158,58 @@ _TEMPLATE = {
             "base_url": "https://opencode.ai/zen/v1",
             "api_key": "YOUR_API_KEY_HERE",
             "protocol": "openai",
-            "enabled": True,
+            "enabled": False,
             "streaming": True,
             "model_map": {
                 "gpt-oss-120b-medium": "minimax-m2.5-free"
-            }
+            },
         }
     ],
     "patcher": {
         "target_url": "https://127.0.0.1:9527",
-        "ide_path": "C:\\Path\\To\\Antigravity\\resources\\app\\out"
-    }
+        "ide_path": "C:\\Path\\To\\Antigravity\\resources\\app\\out",
+        "flag_file": "C:\\Path\\To\\Antigravity_model_api_extension\\scratchpad\\ag_proxy_refresh.flag",
+    },
+    "model_pool": {
+        "mapped_model": "gpt-oss-120b-medium",
+        "pool_settings": {
+            "safety_buffer_tokens": 8192,
+            "all_cooled_fallback": "keep-alive",
+            "keep_alive_timeout_minutes": 10,
+            "fallback_model_limits": {
+                "max_output_tokens": 64000,
+                "thinking_budget": 1024,
+            },
+        },
+        "entries": [
+            {
+                "id": "provider-key-1",
+                "label": "Provider Name (key 1)",
+                "base_url": "https://api.example.com/v1",
+                "api_key": "YOUR_API_KEY_HERE",
+                "model": "your-model-name",
+                "streaming": True,
+                "weight": 1,
+                "enabled": True,
+                "limits": {
+                    "rpm": None,
+                    "tpm": None,
+                    "rpd": None,
+                },
+                "context_window": 200000,
+                "safety_buffer_tokens": None,
+                "thinking": {
+                    "enabled": True,
+                    "budget": 4024,
+                    "enable_param": "thinking",
+                    "budget_param": "thinking_budget",
+                },
+                "response_thinking_field": "reasoning",
+                "cooldown_until": None,
+                "cooldown_reason": None,
+            }
+        ],
+    },
 }
 
 
