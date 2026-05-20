@@ -108,6 +108,9 @@ class PoolSettings:
     fallback_limits: FallbackModelLimits = None  # real limits of fallback model
     flag_file: str | None = None   # path to ag_proxy_refresh.flag (from patcher config)
     keep_alive_timeout_minutes: int = 10  # max minutes to wait in keep-alive mode before passthrough
+    # Path to the separate runtime cooldown state file (never mixed into config.json).
+    # Written by _persist_cooldown_state(); loaded at startup to restore cooldowns.
+    cooldowns_file: str = "scratchpad/cooldowns.json"
 
     def __post_init__(self):
         if self.fallback_limits is None:
@@ -176,37 +179,40 @@ _TEMPLATE = {
             "safety_buffer_tokens": 8192,
             "all_cooled_fallback": "keep-alive",
             "keep_alive_timeout_minutes": 10,
+            "cooldowns_file": "scratchpad/cooldowns.json",
             "fallback_model_limits": {
                 "max_output_tokens": 64000,
                 "thinking_budget": 1024,
             },
         },
-        "entries": [
+        "providers": [
             {
-                "id": "provider-key-1",
-                "label": "Provider Name (key 1)",
+                "id": "my-provider",
+                "name": "My Provider",
                 "base_url": "https://api.example.com/v1",
-                "api_key": "YOUR_API_KEY_HERE",
-                "model": "your-model-name",
                 "streaming": True,
-                "weight": 1,
                 "enabled": True,
-                "limits": {
-                    "rpm": None,
-                    "tpm": None,
-                    "rpd": None,
+                "defaults": {
+                    "thinking": {
+                        "enabled": True,
+                        "budget": 4096,
+                        "enable_param": "thinking",
+                        "budget_param": "thinking_budget"
+                    },
+                    "response_thinking_field": "reasoning"
                 },
-                "context_window": 200000,
-                "safety_buffer_tokens": None,
-                "thinking": {
-                    "enabled": True,
-                    "budget": 4024,
-                    "enable_param": "thinking",
-                    "budget_param": "thinking_budget",
-                },
-                "response_thinking_field": "reasoning",
-                "cooldown_until": None,
-                "cooldown_reason": None,
+                "models": [
+                    {
+                        "id": "my-model",
+                        "model": "your-model-name",
+                        "context_window": 200000,
+                        "weight": 1,
+                        "limits": {"rpm": None, "tpm": None, "rpd": None}
+                    }
+                ],
+                "keys": [
+                    {"id": "provider-key-1", "model_ref": "my-model", "api_key": "YOUR_API_KEY_HERE"}
+                ]
             }
         ],
     },
@@ -361,6 +367,7 @@ def _parse_config(raw: dict) -> AppConfig:
             fallback_limits=fallback_limits,
             flag_file=patcher_raw.get("flag_file"),  # threaded from patcher section
             keep_alive_timeout_minutes=int(ps.get("keep_alive_timeout_minutes", 10)),
+            cooldowns_file=str(ps.get("cooldowns_file", "scratchpad/cooldowns.json")),
         )
 
     return AppConfig(

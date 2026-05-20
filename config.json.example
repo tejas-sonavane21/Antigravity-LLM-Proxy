@@ -42,63 +42,72 @@
       "safety_buffer_tokens": 8192,
       "all_cooled_fallback": "keep-alive",
       "keep_alive_timeout_minutes": 10,
+      "cooldowns_file": "scratchpad/cooldowns.json",
       "fallback_model_limits": {
         "max_output_tokens": 64000,
         "thinking_budget": 1024
       }
     },
-    "entries": [
+    "providers": [
       {
-        "id": "oc-key-1",
-        "label": "OpenCode MiniMax M2.5 Free (key 1)",
-        "base_url": "https://opencode.ai/zen/v1",
-        "api_key": "YOUR_OPENCODE_KEY_HERE",
-        "model": "minimax-m2.5-free",
+        "id": "my-provider",
+        "name": "My Provider",
+        "base_url": "https://api.example.com/v1",
         "streaming": true,
-        "weight": 1,
         "enabled": true,
-        "limits": {
-          "rpm": null,
-          "tpm": null,
-          "rpd": null
+        "defaults": {
+          "thinking": {
+            "enabled": true,
+            "budget": 4096,
+            "enable_param": "thinking",
+            "budget_param": "thinking_budget"
+          },
+          "response_thinking_field": "reasoning"
         },
-        "context_window": 197000,
-        "safety_buffer_tokens": null,
-        "thinking": {
-          "enabled": true,
-          "budget": 4024,
-          "enable_param": "thinking",
-          "budget_param": "thinking_budget"
-        },
-        "response_thinking_field": "reasoning",
-        "cooldown_until": null,
-        "cooldown_reason": null
-      },
-      {
-        "id": "sf-key-1",
-        "label": "SiliconFlow Qwen3.5-397B-A17B (key 1)",
-        "base_url": "https://api.siliconflow.com/v1",
-        "api_key": "YOUR_SILICONFLOW_KEY_HERE",
-        "model": "Qwen/Qwen3.5-397B-A17B",
-        "streaming": true,
-        "weight": 1,
-        "enabled": true,
-        "limits": {
-          "rpm": 500,
-          "tpm": 2000000,
-          "rpd": null
-        },
-        "context_window": 262144,
-        "safety_buffer_tokens": null,
-        "thinking": {
-          "enabled": true,
-          "budget": 4024,
-          "enable_param": "enable_thinking",
-          "budget_param": "thinking_budget"
-        },
-        "response_thinking_field": "reasoning_content",
-        "cooldown_until": null,
-        "cooldown_reason": null
+        "models": [
+          {
+            "id": "my-model",
+            "model": "your-model-name",
+            "context_window": 200000,
+            "weight": 1,
+            "limits": {
+              "rpm": null,
+              "tpm": null,
+              "rpd": null
+            }
+          },
+          {
+            "id": "my-model-no-thinking",
+            "model": "your-non-thinking-model",
+            "context_window": 128000,
+            "weight": 1,
+            "limits": {
+              "rpm": 100,
+              "tpm": 500000,
+              "rpd": null
+            },
+            "thinking": {
+              "enabled": false
+            }
+          }
+        ],
+        "keys": [
+          {
+            "id": "provider-key-1",
+            "model_ref": "my-model",
+            "api_key": "YOUR_API_KEY_1"
+          },
+          {
+            "id": "provider-key-2",
+            "model_ref": "my-model",
+            "api_key": "YOUR_API_KEY_2"
+          },
+          {
+            "id": "provider-key-3",
+            "model_ref": "my-model-no-thinking",
+            "api_key": "YOUR_API_KEY_1"
+          }
+        ]
       }
     ]
   }

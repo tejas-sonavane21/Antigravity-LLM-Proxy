@@ -176,43 +176,31 @@ class PoolPicker:
 
     Attributes:
         entries:        The full list of PoolEntry objects (all states).
-        pool_settings:  Global pool settings (fallback model, buffer size).
-        config_path:    Path to config.json for atomic writes.
-        raw_config:     Reference to the live FULL raw config dict.
-                        Cooldown writes update raw_config["model_pool"]["entries"]
-                        in-place, then write the complete dict atomically.
+        pool_settings:  Global pool settings (fallback model, buffer size, cooldowns path).
         pending_advance: Set to True when a pool request fires the on-demand
                         fetchAvailableModels trigger. Cleared when the interceptor
                         serves the patched response.
+
+    Cooldown persistence:
+        Runtime cooldown state (cooldown_until, cooldown_reason) is written to a
+        SEPARATE cooldowns.json file, NOT into config.json. This keeps config.json
+        as a pure user-managed file that the proxy never touches at runtime.
+        The cooldowns_file path comes from pool_settings.cooldowns_file.
     """
 
     def __init__(
         self,
         entries: list[PoolEntry],
         pool_settings: PoolSettings,
-        config_path: str,
-        raw_config: dict,
     ) -> None:
-        # Validate at construction time -- fail early if wrong dict passed
-        missing = [s for s in _REQUIRED_SECTIONS if s not in raw_config]
-        if missing:
-            raise ValueError(
-                f"PoolPicker __init__: raw_config is missing required sections: "
-                f"{missing}. Pass the full config dict, not a sub-section."
-            )
-
         self.entries = entries
         self.pool_settings = pool_settings
-        self.config_path = config_path
-        self.raw_config = raw_config
 
         # Metadata pre-announcement state (Phase 4)
         self.pending_advance: bool = False
         self._cached_model_response: bytes | None = None
 
-        # Internal peek cursor — tracks which entry was last announced via
-        # fetchAvailableModels. Stored as entry ID (not index) so it remains
-        # correct even when _sorted_candidates() reorders as last_used_at updates.
+        # Internal peek cursor
         # None = start-of-list (peek returns candidates[0]).
         self._peek_entry_id: str | None = None
 
@@ -483,66 +471,71 @@ class PoolPicker:
 
     def _persist_cooldown_state(self) -> None:
         """
-        Write all current cooldown_until / cooldown_reason values back into
-        config.json, updating ONLY those two fields per entry.
+        Write all current cooldown_until / cooldown_reason values to cooldowns.json.
 
-        IMPORTANT — Live re-read strategy:
-            We re-read config.json from disk immediately before writing instead
-            of using self.raw_config (which was loaded once at startup).
-            This prevents the "stale snapshot" bug: if the user edits config.json
-            while the proxy is running (thinking.enabled, new keys, pool_settings
-            changes), a naive write of the startup snapshot would silently
-            overwrite those edits. Re-reading ensures we only ever touch
-            cooldown_until / cooldown_reason, leaving everything else on disk
-            exactly as it is.
+        Format: {entry_id: {cooldown_until: str|null, cooldown_reason: str|null}}
+
+        Strategy:
+          - Always write ALL entries (even those with null values) so the file is
+            a complete snapshot of the current state.
+          - Entries with no cooldown have their values set to null (never omitted).
+          - config.json is NEVER touched — the proxy only writes to cooldowns.json.
+          - On first write, the file is created; the scratchpad/ directory is
+            created if it doesn't exist.
+          - Uses the same temp-file-then-rename atomic pattern as write_config_atomic.
         """
         import json as _json
+        import os as _os
+        import tempfile as _tempfile
         from pathlib import Path as _Path
 
-        abs_path = str(_Path(self.config_path).resolve())
+        cooldowns_path = self.pool_settings.cooldowns_file
+        abs_path = str(_Path(cooldowns_path).resolve())
 
-        # Re-read live config from disk
+        # Build the state dict
+        state: dict = {}
+        for entry in self.entries:
+            state[entry.id] = {
+                "cooldown_until": (
+                    entry.cooldown_until.isoformat()
+                    if entry.cooldown_until is not None
+                    else None
+                ),
+                "cooldown_reason": entry.cooldown_reason,
+            }
+
+        # Ensure directory exists
         try:
-            live_raw = _json.loads(_Path(abs_path).read_text(encoding="utf-8"))
+            _Path(abs_path).parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _log.error(
+                f"PoolPicker: Could not create cooldowns directory: {exc}. "
+                f"Cooldown state NOT persisted."
+            )
+            return
+
+        # Atomic write: temp file → fsync → rename
+        dir_path = str(_Path(abs_path).parent)
+        try:
+            fd, tmp_path = _tempfile.mkstemp(dir=dir_path, suffix=".tmp")
+            try:
+                with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                    _json.dump(state, f, indent=2)
+                    f.flush()
+                    _os.fsync(f.fileno())
+                # Verify the temp file parses cleanly before committing
+                _json.loads(_Path(tmp_path).read_text(encoding="utf-8"))
+                _os.replace(tmp_path, abs_path)
+            except Exception:
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         except Exception as exc:
             _log.error(
-                f"PoolPicker: Failed to re-read config.json before cooldown "
-                f"write: {exc}. Cooldown state NOT persisted."
-            )
-            return
-
-        # Validate structure before touching anything
-        missing = [s for s in _REQUIRED_SECTIONS if s not in live_raw]
-        if missing:
-            _log.error(
-                f"PoolPicker: Re-read config.json is missing sections "
-                f"{missing}. Cooldown state NOT persisted."
-            )
-            return
-
-        # Update ONLY cooldown fields in the live dict
-        raw_entries = live_raw.get("model_pool", {}).get("entries", [])
-        raw_by_id: dict[str, dict] = {e.get("id"): e for e in raw_entries}
-
-        for entry in self.entries:
-            raw = raw_by_id.get(entry.id)
-            if raw is None:
-                continue  # entry added to config after startup — skip safely
-            raw["cooldown_until"] = (
-                entry.cooldown_until.isoformat()
-                if entry.cooldown_until is not None
-                else None
-            )
-            raw["cooldown_reason"] = entry.cooldown_reason
-
-        # Keep in-memory reference current so next re-read sees a clean base
-        self.raw_config = live_raw
-
-        try:
-            write_config_atomic(self.config_path, live_raw)
-        except RuntimeError as exc:
-            _log.error(
-                f"PoolPicker: Failed to persist cooldown state: {exc}. "
+                f"PoolPicker: Failed to persist cooldown state to "
+                f"{cooldowns_path!r}: {exc}. "
                 f"State is correct in memory but will be lost on restart."
             )
 
@@ -582,8 +575,6 @@ def get_picker() -> PoolPicker | None:
 def init_picker(
     entries: list[PoolEntry],
     pool_settings: PoolSettings,
-    config_path: str,
-    raw_config: dict,
 ) -> PoolPicker:
     """
     Initialize the global PoolPicker singleton.
@@ -592,18 +583,12 @@ def init_picker(
     Args:
         entries:       Parsed PoolEntry list from parse_pool_entries().
         pool_settings: Parsed PoolSettings from AppConfig.pool_settings.
-        config_path:   Path to config.json for atomic cooldown writes.
-        raw_config:    The FULL raw dict loaded from config.json.
-                       Must contain all top-level sections (proxy, upstream,
-                       tls, providers, patcher, model_pool). The PoolPicker
-                       constructor validates this and raises ValueError if wrong.
+                       pool_settings.cooldowns_file controls where runtime
+                       cooldown state is persisted.
 
     Returns:
         The initialized PoolPicker instance.
-
-    Raises:
-        ValueError: If raw_config is missing required top-level sections.
     """
     global _picker_instance
-    _picker_instance = PoolPicker(entries, pool_settings, config_path, raw_config)
+    _picker_instance = PoolPicker(entries, pool_settings)
     return _picker_instance

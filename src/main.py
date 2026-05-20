@@ -125,13 +125,10 @@ def log_config_summary(config: AppConfig) -> None:
     # Pool summary
     if config.pool_settings is not None:
         ps = config.pool_settings
-        raw_pool = config.raw_model_pool or {}
-        entries_raw = raw_pool.get("entries", [])
-        enabled_count = sum(1 for e in entries_raw if e.get("enabled", True))
         log.info(
             f"Model pool: mapped_model={ps.mapped_model!r} | "
-            f"{len(entries_raw)} entries ({enabled_count} enabled) | "
-            f"fallback={ps.all_cooled_fallback!r}"
+            f"fallback={ps.all_cooled_fallback!r} | "
+            f"cooldowns_file={ps.cooldowns_file!r}"
         )
     else:
         log.info("Model pool: NOT configured (pool routing disabled)")
@@ -213,19 +210,14 @@ def main() -> None:
         log.info("-" * 60)
         log.info("Initializing model key pool...")
         try:
-            pool_entries, _ = parse_pool_entries(config.raw_model_pool)
-
-            # Load the raw full config dict so _persist_cooldown_state
-            # can write the ENTIRE config.json atomically (not just pool section).
-            import json as _json
-            from pathlib import Path as _Path
-            _raw_full_cfg = _json.loads(_Path("config.json").read_text(encoding="utf-8"))
+            pool_entries, _ = parse_pool_entries(
+                config.raw_model_pool,
+                cooldowns_path=config.pool_settings.cooldowns_file,
+            )
 
             picker = init_picker(
                 entries=pool_entries,
                 pool_settings=config.pool_settings,
-                config_path="config.json",
-                raw_config=_raw_full_cfg,   # full config dict for atomic writes
             )
             log.info(
                 f"Pool ready: {len(pool_entries)} entries | "
@@ -241,7 +233,7 @@ def main() -> None:
                 )
         except (ValueError, KeyError) as exc:
             log.error(f"Pool initialization failed: {exc}")
-            log.error("Check model_pool.entries in config.json.")
+            log.error("Check model_pool.providers in config.json.")
             sys.exit(1)
 
         # --- Initialize on-demand refresh flag file ---
