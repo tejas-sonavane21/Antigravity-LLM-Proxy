@@ -64,10 +64,14 @@
           },
           "response_thinking_field": "reasoning"
         },
+        "default_models": [
+          "my-model-a",
+          "my-model-b"
+        ],
         "models": [
           {
-            "id": "my-model",
-            "model": "your-model-name",
+            "id": "my-model-a",
+            "model": "provider/model-a",
             "context_window": 200000,
             "weight": 1,
             "limits": {
@@ -77,8 +81,8 @@
             }
           },
           {
-            "id": "my-model-no-thinking",
-            "model": "your-non-thinking-model",
+            "id": "my-model-b",
+            "model": "provider/model-b",
             "context_window": 128000,
             "weight": 1,
             "limits": {
@@ -94,18 +98,18 @@
         "keys": [
           {
             "id": "provider-key-1",
-            "model_ref": "my-model",
             "api_key": "YOUR_API_KEY_1"
           },
           {
             "id": "provider-key-2",
-            "model_ref": "my-model",
             "api_key": "YOUR_API_KEY_2"
           },
           {
             "id": "provider-key-3",
-            "model_ref": "my-model-no-thinking",
-            "api_key": "YOUR_API_KEY_1"
+            "model_ref": [
+              "my-model-a"
+            ],
+            "api_key": "YOUR_API_KEY_3"
           }
         ]
       }

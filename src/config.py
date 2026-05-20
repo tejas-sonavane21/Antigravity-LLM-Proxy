@@ -201,6 +201,7 @@ _TEMPLATE = {
                     },
                     "response_thinking_field": "reasoning"
                 },
+                "default_models": ["my-model"],  # keys inherit this list if no model_ref
                 "models": [
                     {
                         "id": "my-model",
@@ -210,8 +211,11 @@ _TEMPLATE = {
                         "limits": {"rpm": None, "tpm": None, "rpd": None}
                     }
                 ],
+                # Keys with no model_ref use default_models automatically.
+                # model_ref is ALWAYS a list; use ["model-id"] for one model.
                 "keys": [
-                    {"id": "provider-key-1", "model_ref": "my-model", "api_key": "YOUR_API_KEY_HERE"}
+                    {"id": "provider-key-1", "api_key": "YOUR_API_KEY_HERE"},
+                    {"id": "provider-key-2", "model_ref": ["my-model"], "api_key": "YOUR_API_KEY_HERE"}
                 ]
             }
         ],

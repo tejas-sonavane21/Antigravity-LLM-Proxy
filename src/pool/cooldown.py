@@ -175,7 +175,7 @@ def resolve_cooldown(
         cooldown_until = now + timedelta(seconds=_COOLDOWN_PERM_4XX_S)
         reason = (
             f"{http_status}: Permanent error "
-            f"({_COOLDOWN_PERM_4XX_S // 3600}h cooldown — check model/key config)"
+            f"({_COOLDOWN_PERM_4XX_S // 3600}h cooldown - check model/key config)"
         )
 
     _log.warning(
