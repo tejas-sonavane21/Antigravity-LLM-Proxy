@@ -44,9 +44,12 @@ from src.provider.openai_compat import OpenAICompatProvider
 
 _log = logging.getLogger("pool.handler")
 
-# Maximum number of DIFFERENT pool entries to try before falling back to Google.
-# This is separate from the per-entry retry count (_MAX_RETRIES for transient errors).
-_MAX_POOL_ATTEMPTS = 6
+# Maximum number of DIFFERENT pool entries to try before falling back.
+# This was previously a hardcoded constant (6) which caused entries beyond
+# index 6 to be silently ignored when earlier keys all hit errors.
+# Now it is set dynamically to len(picker.entries) in handle_pool_request.
+_MAX_POOL_ATTEMPTS = 6  # legacy default — overridden at runtime by pool size
+
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +357,9 @@ async def handle_pool_request(
 
     attempted_ids: set[str] = set()
     pool_attempt = 0
+    # Try every entry in the pool before falling back — derived from actual pool
+    # size so adding new keys never requires touching this code.
+    max_pool_attempts = len(picker.entries)
 
     while True:
 
@@ -400,7 +406,7 @@ async def handle_pool_request(
             continue
 
         # Guard: max distinct pool entries tried in one request
-        if pool_attempt > _MAX_POOL_ATTEMPTS:
+        if pool_attempt > max_pool_attempts:
             break
 
         attempted_ids.add(entry.id)
@@ -554,14 +560,14 @@ async def handle_pool_request(
             _log.warning(
                 f"[POOL] [{entry.id}] permanent error {last_http_status} — "
                 f"cooling and trying next pool entry "
-                f"(attempt {pool_attempt}/{_MAX_POOL_ATTEMPTS})"
+                f"(attempt {pool_attempt}/{max_pool_attempts})"
             )
         else:
             _log.error(
                 f"[POOL] [{entry.id}] failed after {_MAX_RETRIES} retries "
                 f"(status={last_http_status}) — "
                 f"cooling and trying next pool entry "
-                f"(attempt {pool_attempt}/{_MAX_POOL_ATTEMPTS})"
+                f"(attempt {pool_attempt}/{max_pool_attempts})"
             )
 
         picker.release(entry.id, last_http_status, last_error_body)
@@ -569,7 +575,7 @@ async def handle_pool_request(
 
     # All pool attempts exhausted without success
     _log.error(
-        f"[POOL] All {_MAX_POOL_ATTEMPTS} pool attempt(s) exhausted — "
+        f"[POOL] All {max_pool_attempts} pool attempt(s) exhausted — "
         f"falling back to Google"
     )
     async for chunk in _handle_all_cooled(
