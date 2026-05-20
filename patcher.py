@@ -68,17 +68,39 @@ URL_PATTERN = re.compile(
 PATCHED_URL_PATTERN = re.compile(r"https?://127\.0\.0\.1:(\d+)")
 
 
-# Exact string that ends _startUserStatusRefreshTimer() in the new main.js.
-# Confirmed unique occurrence at char 12,394,795 (new build, ~12.9MB file).
-# IIFE is injected INSIDE _startUserStatusRefreshTimer() so arrow function
-# captures `this` (the aGe / AntigravityAuthMainService instance).
+# Injection point: inside the constructor's .finally() arrow function body,
+# immediately after this._onDidInitialize.fire().
 #
-# Variable name changes vs old build:
-#   Old: this.r=setInterval(t,xTa)}   (fully minified)
-#   New: this._userStatusRefreshTimer=setInterval(t,OOa)}  (less minified)
-#   Old: this.n  (oauthTokenObservable)  →  New: this._oauthTokenObservable
-#   Old: R6(...)  (token helper)          →  New: _5(...)
-POOL_TRIGGER_TARGET = "this._userStatusRefreshTimer=setInterval(t,OOa)}"
+# Confirmed unique occurrence at char 12,394,117 (new build, ~12.9MB file).
+#
+# WHY this location (not _startUserStatusRefreshTimer):
+#   aGe is a real ES6 class (aGe=class extends ra{...}).
+#   In an ES6 class body ONLY method definitions, class fields, and static
+#   blocks are valid class elements. Injecting an IIFE after the closing }
+#   of ANY class method puts it between class elements — causing a SyntaxError.
+#   Electron/Node.js silently swallows module-level SyntaxErrors, so the
+#   entire auth service module fails to load with no visible error popup.
+#   Result: _onDidInitialize never fires, onboardUser never called, chat broken.
+#
+# WHY the finally block works:
+#   The constructor ends with:
+#     this.initialize().then(...).catch(...).finally(()=>{this._onDidInitialize.fire()})
+#   This is an arrow function body — arbitrary expression statements are valid.
+#   `this` inside the finally arrow function IS the aGe service instance
+#   (arrow functions capture `this` lexically from the constructor).
+#   Our IIFE runs synchronously at this point but sets up an async fs.watch
+#   callback; the callback also captures `this` correctly via arrow function.
+#
+# The specific target string is unique in the file (verified):
+#   }).finally(()=>{this._onDidInitialize.fire()})  ← only 1 occurrence
+# We target just the fire() call (no closing })) so the IIFE injects
+# INSIDE the finally arrow body before its }.
+POOL_TRIGGER_TARGET = "this._onDidInitialize.fire()"
+
+# To disambiguate from the 2nd fire() occurrence elsewhere, do_pool_trigger_patch
+# must use the full-context sentinel during the search (see do_pool_trigger_patch).
+# The UNIQUE surrounding string is:
+POOL_TRIGGER_TARGET_CONTEXT = "}).finally(()=>{this._onDidInitialize.fire()})"
 
 # Flag file path placeholder — replaced by do_pool_trigger_patch() at patch time.
 # The actual path (e.g. D:\\...\\scratchpad\\ag_proxy_refresh.flag) is embedded
@@ -393,7 +415,7 @@ def do_status(ide_path: str) -> None:
     # Check pool trigger state
     print()
     if POOL_TRIGGER_SENTINEL in content:
-        print("  Pool trigger: INJECTED (port 9528 HTTP server present)")
+        print("  Pool trigger: INJECTED (Flag file watcher found)")
     else:
         print("  Pool trigger: NOT INJECTED (run 'python patcher.py pool-trigger-patch')")
 
@@ -424,23 +446,27 @@ def do_status(ide_path: str) -> None:
 
 def do_pool_trigger_patch(ide_path: str) -> None:
     """
-    Inject the fs.watch()-based refresh trigger into AntigravityAuthMainService.M()
+    Inject the fs.watch()-based refresh trigger into AntigravityAuthMainService
     in main.js.
 
-    The trigger is an arrow-function IIFE appended to the end of M(), right after
-    'this.r=setInterval(t,xTa)'. It sets up a Node.js fs.watch() on the shared
-    ag_proxy_refresh.flag file. When the proxy writes "1" to that file, the watcher
-    fires, reads "1", writes "0" back, and calls refreshUserStatus() — causing
-    Antigravity to make a fresh fetchAvailableModels request that our proxy
-    intercepts and patches with the next pool entry's context window.
+    Injection point (new build):
+        The constructor's .finally() arrow function body, immediately after
+        this._onDidInitialize.fire(). This is INSIDE an arrow function, so
+        `this` correctly refers to the aGe service instance.
+
+        Constructor ends with:
+          this.initialize().then(...).catch(...).finally(()=>{this._onDidInitialize.fire()})
+
+        After injection:
+          .finally(()=>{this._onDidInitialize.fire();IIFE})
+
+        The IIFE is a valid statement in a function body and does NOT break
+        the ES6 class syntax (it's inside the constructor, not between methods).
 
     The flag file path is read from config.json (patcher.flag_file) and embedded
     as a string literal in the injected JS code at patch time.
 
-    Target method (minified, single line in main.js):
-        M(){this.r&&clearInterval(this.r);const t=async()=>{...};t(),this.r=setInterval(t,xTa)}
-
-    Confirmed unique occurrence at ~char 11,561,180.
+    Confirmed unique full-context occurrence at char ~12,394,117 (new build).
     """
     main_js = Path(ide_path) / "main.js"
 
@@ -480,43 +506,45 @@ def do_pool_trigger_patch(ide_path: str) -> None:
         print("  [ALREADY] Pool trigger is already injected. Nothing to do.")
         return
 
-    # Verify target string is present
-    if POOL_TRIGGER_TARGET not in content:
+    # Use the full-context string for safe unique matching.
+    # POOL_TRIGGER_TARGET appears twice in main.js; POOL_TRIGGER_TARGET_CONTEXT
+    # is unique (verified: exactly 1 occurrence).
+    if POOL_TRIGGER_TARGET_CONTEXT not in content:
         _error(
-            f"Injection target not found in main.js.\n"
-            f"Expected: {POOL_TRIGGER_TARGET!r}\n"
-            f"The IDE may have been updated. Inspect main.js around 'refreshUserStatus' "
-            f"and update POOL_TRIGGER_TARGET in patcher.py."
+            f"Injection context not found in main.js.\n"
+            f"Expected: {POOL_TRIGGER_TARGET_CONTEXT!r}\n"
+            f"The IDE may have been updated. Inspect main.js near '_onDidInitialize.fire()' "
+            f"and update POOL_TRIGGER_TARGET_CONTEXT in patcher.py."
         )
 
-    # Count occurrences (must be exactly 1 for safe injection)
-    count = content.count(POOL_TRIGGER_TARGET)
+    count = content.count(POOL_TRIGGER_TARGET_CONTEXT)
     if count != 1:
         _error(
-            f"Expected exactly 1 occurrence of the injection target, found {count}.\n"
-            f"Target: {POOL_TRIGGER_TARGET!r}\n"
+            f"Expected exactly 1 occurrence of the injection context, found {count}.\n"
+            f"Context: {POOL_TRIGGER_TARGET_CONTEXT!r}\n"
             f"Manual inspection of main.js required."
         )
 
     # Build the final injection with the real flag file path embedded.
     # flag_file from config.json has real single backslashes: D:\path\to\file
     # In a JS single-quoted string literal each \ must be written as \\
-    # POOL_TRIGGER_INJECT contains the placeholder already quoted as:
-    #   repr(_FLAG_PATH_PLACEHOLDER) == "'__FLAG_PATH_PLACEHOLDER__'"
-    # We replace that exact token with a properly JS-escaped single-quoted path.
     js_flag_path = "'" + flag_file.replace("\\", "\\\\") + "'"
     final_inject = POOL_TRIGGER_INJECT.replace(repr(_FLAG_PATH_PLACEHOLDER), js_flag_path)
 
-    # Build replacement: target without closing `}` + IIFE + `}` closes M()
-    pool_trigger_replacement = (
-        POOL_TRIGGER_TARGET[:-1]   # strip the closing } of M()
-        + final_inject             # IIFE as last statement inside M()
-        + "}"                      # M()'s closing } — after the IIFE
+    # Build replacement:
+    # Original: }).finally(()=>{this._onDidInitialize.fire()})
+    # Patched:  }).finally(()=>{this._onDidInitialize.fire();IIFE})
+    # The IIFE is inserted INSIDE the finally arrow body (before its closing })
+    # so it is a valid expression statement inside a function body.
+    patched_context = POOL_TRIGGER_TARGET_CONTEXT.replace(
+        POOL_TRIGGER_TARGET,           # this._onDidInitialize.fire()
+        POOL_TRIGGER_TARGET + final_inject,  # fire();IIFE
+        1,
     )
 
     patched = content.replace(
-        POOL_TRIGGER_TARGET,
-        pool_trigger_replacement,
+        POOL_TRIGGER_TARGET_CONTEXT,
+        patched_context,
         1,  # replace only the first (and only) occurrence
     )
 
