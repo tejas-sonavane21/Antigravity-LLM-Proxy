@@ -190,7 +190,7 @@ def load_patcher_config() -> tuple:
         _error(
             "patcher.ide_path is not set in config.json\n"
             "Set it to your IDE's 'out' directory, e.g.:\n"
-            '  "ide_path": "D:\\\\Anti_Gravity\\\\Antigravity\\\\resources\\\\app\\\\out"'
+            '  "ide_path": "D:\\\\Anti_Gravity\\\\Antigravity IDE\\\\resources\\\\app\\\\out"'
         )
 
     ide_path = Path(ide_path_raw)

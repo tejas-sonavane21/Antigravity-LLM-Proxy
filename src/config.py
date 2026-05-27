@@ -170,7 +170,7 @@ _TEMPLATE = {
     ],
     "patcher": {
         "target_url": "https://127.0.0.1:9527",
-        "ide_path": "C:\\Path\\To\\Antigravity\\resources\\app\\out",
+        "ide_path": "D:\\Anti_Gravity\\Antigravity IDE\\resources\\app\\out",
         "flag_file": "C:\\Path\\To\\Antigravity_model_api_extension\\scratchpad\\ag_proxy_refresh.flag",
     },
     "model_pool": {
