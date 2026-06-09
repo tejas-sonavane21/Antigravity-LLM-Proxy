@@ -200,6 +200,7 @@ def main() -> None:
     from src.proxy import router as _router_module
     _router_module.configure(
         dump_model_responses=config.proxy.dump_model_responses,
+        dump_requests=config.proxy.dump_requests,
     )
 
     # --- Pool: Initialize PoolPicker ---

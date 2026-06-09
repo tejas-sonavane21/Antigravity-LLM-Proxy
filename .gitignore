@@ -46,6 +46,7 @@ scratchpad/
 scratchpad/*
 *.flag
 scratchpad/ag_proxy_refresh.flag
+*.bak
 
 # test
 test_streaming_pipeline.py

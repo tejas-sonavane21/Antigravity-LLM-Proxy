@@ -34,6 +34,7 @@ class ProxyConfig:
     log_level: str          # "DEBUG" | "INFO" | "WARNING" | "ERROR"
     include_thoughts: bool  # whether to include thought parts in upstream requests
     dump_model_responses: bool = False  # when True: Q3-DUMP runs on fetchAvailableModels
+    dump_requests: bool = False  # when True: print every intercepted raw request body to terminal
 
 
 @dataclass
@@ -142,6 +143,7 @@ _TEMPLATE = {
         "log_level": "DEBUG",
         "include_thoughts": False,
         "dump_model_responses": False,
+        "dump_requests": False,  # set True to print every intercepted request body
     },
     "upstream": {
         "hosts": [
@@ -309,6 +311,7 @@ def _parse_config(raw: dict) -> AppConfig:
         log_level=proxy_raw["log_level"].upper(),
         include_thoughts=proxy_raw.get("include_thoughts", False),
         dump_model_responses=bool(proxy_raw.get("dump_model_responses", False)),
+        dump_requests=bool(proxy_raw.get("dump_requests", False)),
     )
 
     upstream = UpstreamConfig(

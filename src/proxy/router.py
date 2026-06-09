@@ -40,13 +40,21 @@ log = logging.getLogger("proxy.router")
 # Set via config.json → proxy.dump_model_responses
 _dump_model_responses: bool = False
 
+# When True: print every request intercepted from the IDE to the terminal.
+# Shows method, path, headers, and the FULL decoded body (system prompt, messages, etc.).
+# Set via config.json → proxy.dump_requests
+_dump_requests: bool = False
 
-def configure(*, dump_model_responses: bool = False) -> None:
+
+def configure(*, dump_model_responses: bool = False, dump_requests: bool = False) -> None:
     """Apply runtime configuration to this module. Call once at startup."""
-    global _dump_model_responses
+    global _dump_model_responses, _dump_requests
     _dump_model_responses = dump_model_responses
+    _dump_requests = dump_requests
     if dump_model_responses:
         log.info("[router] Model response dumping ENABLED (dump_model_responses=true)")
+    if dump_requests:
+        log.info("[router] Request dumping ENABLED (dump_requests=true) — all IDE requests will be printed in full")
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +167,95 @@ async def route_request(
     category, model_name, target_model = classify_request(path, body, registry)
 
     # ------------------------------------------------------------------
-    # 1. TELEMETRY -- mock and swallow
+    # 0. REQUEST DUMP — print full raw request before routing (opt-in)
     # ------------------------------------------------------------------
+    if _dump_requests and category is not RequestCategory.TELEMETRY:
+        import json as _json
+        _SEP = "=" * 72
+        print(_SEP, flush=True)
+        print(f"[REQ-DUMP] {method} {path}", flush=True)
+        print(f"[REQ-DUMP] Body size: {len(body)} bytes", flush=True)
+
+        # Headers (sanitise Authorization: show only first 20 chars)
+        print("[REQ-DUMP] Headers:", flush=True)
+        for _hk, _hv in headers.items():
+            _hk_lower = _hk.lower()
+            if _hk_lower == "authorization" and len(_hv) > 28:
+                _hv = _hv[:20] + "...<redacted>"
+            print(f"  {_hk}: {_hv}", flush=True)
+
+        # Body
+        if body:
+            try:
+                _parsed = _json.loads(body.decode("utf-8"))
+                print("[REQ-DUMP] Body (decoded JSON):", flush=True)
+
+                # ── System prompt ────────────────────────────────────────
+                _sys = _parsed.get("systemInstruction") or _parsed.get("system")
+                if _sys:
+                    print("  [SYSTEM PROMPT]:", flush=True)
+                    if isinstance(_sys, dict):
+                        # Gemini format: {role, parts: [{text}]}
+                        for _part in _sys.get("parts", []):
+                            _txt = _part.get("text", "")
+                            print(f"    {_txt}", flush=True)
+                    else:
+                        print(f"    {_sys}", flush=True)
+                else:
+                    print("  [SYSTEM PROMPT]: <none>", flush=True)
+
+                # ── Generation config ────────────────────────────────────
+                _gcfg = _parsed.get("generationConfig") or {}
+                if _gcfg:
+                    print(f"  [GEN CONFIG]: {_json.dumps(_gcfg)}", flush=True)
+
+                # ── Tools ────────────────────────────────────────────────
+                _tools = _parsed.get("tools") or []
+                if _tools:
+                    print(f"  [TOOLS]: {len(_tools)} tool(s) defined", flush=True)
+                    for _t in _tools:
+                        _fdecls = _t.get("functionDeclarations") or []
+                        for _fd in _fdecls:
+                            print(f"    - {_fd.get('name','?')}: {_fd.get('description','')[:80]}", flush=True)
+
+                # ── Conversation turns ───────────────────────────────────
+                _contents = _parsed.get("contents") or []
+                print(f"  [CONTENTS]: {len(_contents)} turn(s)", flush=True)
+                for _i, _turn in enumerate(_contents):
+                    _role = _turn.get("role", "?")
+                    _parts = _turn.get("parts") or []
+                    for _p in _parts:
+                        if "text" in _p:
+                            _txt = _p["text"]
+                            # Print full text, no truncation
+                            print(f"  [TURN {_i}][{_role}] text ({len(_txt)} chars):", flush=True)
+                            print(f"    {_txt}", flush=True)
+                        elif "functionCall" in _p:
+                            _fc = _p["functionCall"]
+                            print(f"  [TURN {_i}][{_role}] functionCall: {_fc.get('name','?')}", flush=True)
+                            print(f"    args: {_json.dumps(_fc.get('args', {}))}", flush=True)
+                        elif "functionResponse" in _p:
+                            _fr = _p["functionResponse"]
+                            _resp_str = _json.dumps(_fr.get('response', {}))
+                            print(f"  [TURN {_i}][{_role}] functionResponse: {_fr.get('name','?')}", flush=True)
+                            print(f"    response: {_resp_str}", flush=True)
+                        else:
+                            print(f"  [TURN {_i}][{_role}] part keys: {list(_p.keys())}", flush=True)
+
+                # ── Anything else at top level ───────────────────────────
+                _shown = {"systemInstruction", "system", "generationConfig", "tools", "contents"}
+                _extra = {k: v for k, v in _parsed.items() if k not in _shown}
+                if _extra:
+                    print(f"  [OTHER FIELDS]: {_json.dumps(_extra)}", flush=True)
+
+            except (_json.JSONDecodeError, UnicodeDecodeError):
+                print(f"[REQ-DUMP] Body (raw, non-JSON):", flush=True)
+                print(body.decode("utf-8", errors="replace"), flush=True)
+        else:
+            print("[REQ-DUMP] Body: <empty>", flush=True)
+
+        print(_SEP, flush=True)
+
     if category is RequestCategory.TELEMETRY:
         log.debug(f"[TELEM] {method} {path}")
         if path == "/log" or path.startswith("/log?"):
