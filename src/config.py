@@ -35,6 +35,7 @@ class ProxyConfig:
     include_thoughts: bool  # whether to include thought parts in upstream requests
     dump_model_responses: bool = False  # when True: Q3-DUMP runs on fetchAvailableModels
     dump_requests: bool = False  # when True: print every intercepted raw request body to terminal
+    dump_pool_io: bool = False   # when True: print outgoing OpenAI body + raw provider response chunks
 
 
 @dataclass
@@ -146,7 +147,8 @@ _TEMPLATE = {
         "log_level": "DEBUG",
         "include_thoughts": False,
         "dump_model_responses": False,
-        "dump_requests": False,  # set True to print every intercepted request body
+        "dump_requests": False,   # set True to print every intercepted request body
+        "dump_pool_io": False,    # set True to print what we send/receive from pool providers
     },
     "upstream": {
         "hosts": [
@@ -315,6 +317,7 @@ def _parse_config(raw: dict) -> AppConfig:
         include_thoughts=proxy_raw.get("include_thoughts", False),
         dump_model_responses=bool(proxy_raw.get("dump_model_responses", False)),
         dump_requests=bool(proxy_raw.get("dump_requests", False)),
+        dump_pool_io=bool(proxy_raw.get("dump_pool_io", False)),
     )
 
     upstream = UpstreamConfig(

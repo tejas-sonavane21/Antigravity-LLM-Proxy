@@ -50,6 +50,89 @@ _log = logging.getLogger("pool.handler")
 # Now it is set dynamically to len(picker.entries) in handle_pool_request.
 _MAX_POOL_ATTEMPTS = 6  # legacy default — overridden at runtime by pool size
 
+# ---------------------------------------------------------------------------
+# Pool I/O dump flag  (set at startup via configure())
+# ---------------------------------------------------------------------------
+# When True: print the full outgoing OpenAI request body (tools, messages)
+# AND every raw incoming SSE chunk from the provider to the terminal.
+# Activated by config.json -> proxy.dump_pool_io = true
+_dump_pool_io: bool = False
+
+
+def configure(*, dump_pool_io: bool = False) -> None:
+    """Apply runtime configuration. Call once at startup (main.py)."""
+    global _dump_pool_io
+    _dump_pool_io = dump_pool_io
+    # Also set the flag in openai_compat so _iter_stream_events logs raw incoming chunks
+    import src.provider.openai_compat as _compat
+    _compat._dump_pool_io = dump_pool_io
+    if dump_pool_io:
+        _log.info(
+            "[pool.handler] Pool I/O dumping ENABLED (dump_pool_io=true) "
+            "-- outgoing OpenAI body + raw provider SSE will be printed"
+        )
+
+
+_SEP = "=" * 72
+
+
+def _dump_outgoing(openai_body: dict, entry_id: str) -> None:
+    """
+    Print the full OpenAI request body we're about to send to the provider.
+    Redacts the api_key (not present in body, but logs entry_id for reference).
+    Helps diagnose:
+      (C) Are tool definitions reaching the provider correctly?
+      (A) Are messages / conversation history complete?
+    """
+    print(_SEP, flush=True)
+    print(f"[POOL-IO] OUTGOING -> [{entry_id}]", flush=True)
+
+    # Summary line
+    msgs = openai_body.get("messages", [])
+    tools = openai_body.get("tools", [])
+    model = openai_body.get("model", "?")
+    print(
+        f"[POOL-IO] model={model!r}  "
+        f"messages={len(msgs)}  "
+        f"tools={len(tools)}  "
+        f"stream={openai_body.get('stream')}  "
+        f"max_tokens={openai_body.get('max_tokens', 'not-set')}",
+        flush=True,
+    )
+
+    # Tool definitions — most important for diagnosing (C)
+    if tools:
+        print(f"[POOL-IO] TOOLS ({len(tools)}):", flush=True)
+        for t in tools:
+            fn = t.get("function", {})
+            params = fn.get("parameters", {})
+            prop_count = len(params.get("properties", {}))
+            print(
+                f"  - {fn.get('name', '?')}: {fn.get('description', '')[:80]}  "
+                f"[{prop_count} param(s)]",
+                flush=True,
+            )
+        print("[POOL-IO] FULL TOOLS JSON:", flush=True)
+        print(json.dumps(tools, ensure_ascii=False, indent=2), flush=True)
+    else:
+        print("[POOL-IO] TOOLS: (none)", flush=True)
+
+    # Messages — last 3 turns to keep output manageable
+    print(f"[POOL-IO] MESSAGES ({len(msgs)} total, showing last 3):", flush=True)
+    for msg in msgs[-3:]:
+        role = msg.get("role", "?")
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
+            print(f"  [{role}] tool_calls: {names}", flush=True)
+        elif isinstance(content, str):
+            preview = content[:200].replace("\n", " ")
+            print(f"  [{role}] {preview!r}", flush=True)
+        else:
+            print(f"  [{role}] (non-text content)", flush=True)
+
+    print(_SEP, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +528,11 @@ async def handle_pool_request(
 
         openai_body["stream"] = True
         openai_body = _inject_thinking(openai_body, entry)
+
+        # ── Dump outgoing body if pool I/O logging is enabled ─────────────
+        if _dump_pool_io:
+            _dump_outgoing(openai_body, entry.id)
+
         # max_tokens is NOT overridden here. usable_tokens is the context window
         # we announce to the IDE via FAMS — not the per-request output limit.
         # The Gemini->OpenAI converter maps generationConfig.maxOutputTokens from

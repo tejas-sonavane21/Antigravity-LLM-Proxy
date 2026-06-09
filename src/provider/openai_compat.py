@@ -83,13 +83,23 @@ _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _MAX_RETRIES = 3
 _BACKOFF_MULTIPLIER = 0.5
 
-# OpenAI finish_reason → Gemini finishReason
+# OpenAI finish_reason -> Gemini finishReason
 _FINISH_REASON_MAP = {
     "stop":       "STOP",
     "tool_calls": "STOP",
     "length":     "MAX_TOKENS",
     "max_tokens": "MAX_TOKENS",
 }
+
+# ---------------------------------------------------------------------------
+# Pool I/O dump flag  (shared with handler.py via this module-level var)
+# ---------------------------------------------------------------------------
+# Set by pool.handler.configure() at startup. When True, every raw SSE chunk
+# received from the provider is printed to the terminal BEFORE our converter
+# processes it. Helps diagnose:
+#   (A) Is provider returning text instead of tool_calls?
+#   (B) Are tool call deltas present in the raw response?
+_dump_pool_io: bool = False
 
 # ---------------------------------------------------------------------------
 # Heartbeat / keepalive
@@ -545,6 +555,26 @@ class OpenAICompatProvider:
                     continue
 
                 chunk_num += 1
+
+                # ── Raw incoming dump (diagnose A & B) ─────────────────────
+                if _dump_pool_io:
+                    # Print every chunk but cap args/content to avoid terminal floods
+                    try:
+                        _dc = json.loads(data_str)
+                        _ch0 = (_dc.get("choices") or [{}])[0]
+                        _delta = _ch0.get("delta", {})
+                        _fin   = _ch0.get("finish_reason")
+                        _tc    = _delta.get("tool_calls")
+                        _cnt   = _delta.get("content", "")
+                        _rsn   = _delta.get("reasoning") or _delta.get("thinking_content", "")
+                        _summary_parts = [f"chunk#{chunk_num}"]
+                        if _fin:   _summary_parts.append(f"finish={_fin!r}")
+                        if _cnt:   _summary_parts.append(f"content=+{len(_cnt)}ch")
+                        if _rsn:   _summary_parts.append(f"reasoning=+{len(_rsn)}ch")
+                        if _tc:    _summary_parts.append(f"tool_calls={json.dumps(_tc)[:300]}")
+                        print(f"[POOL-IO] INCOMING {' | '.join(_summary_parts)}", flush=True)
+                    except Exception:
+                        print(f"[POOL-IO] INCOMING chunk#{chunk_num}: {data_str[:300]}", flush=True)
 
                 if chunk.get("model"):
                     last_model = chunk["model"]

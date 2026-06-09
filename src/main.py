@@ -203,6 +203,11 @@ def main() -> None:
         dump_requests=config.proxy.dump_requests,
     )
 
+    from src.pool import handler as _handler_module
+    _handler_module.configure(
+        dump_pool_io=config.proxy.dump_pool_io,
+    )
+
     # --- Pool: Initialize PoolPicker ---
     if config.pool_settings is not None and config.raw_model_pool is not None:
         from src.pool.config_parser import parse_pool_entries
