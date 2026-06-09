@@ -40,6 +40,7 @@ Reference: config_dry_redesign.md v3 final decisions
 
 import json
 import logging
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -50,6 +51,46 @@ from src.pool.entry import LimitsConfig, PoolEntry, ThinkingConfig
 _log = logging.getLogger("pool.config_parser")
 
 _GLOBAL_DEFAULT_SAFETY_BUFFER = 8192
+
+
+# ---------------------------------------------------------------------------
+# SQLite key loader
+# ---------------------------------------------------------------------------
+
+def load_keys_from_db(db_path: str, provider_id: str) -> list[dict]:
+    """
+    Load all enabled keys for a provider from keys.db.
+
+    Returns a list of dicts matching the old config.json keys[] format:
+        [{"id": "cl-key-1", "api_key": "..."}, ...]
+
+    Returns [] silently if:
+      - The DB file does not exist yet (fresh setup, no keys added).
+      - The provider has no enabled keys in the DB.
+    """
+    path = Path(db_path)
+    if not path.exists():
+        _log.debug(
+            f"[pool.config_parser] keys.db not found at '{db_path}' "
+            f"— provider '{provider_id}' will have 0 keys from DB."
+        )
+        return []
+    try:
+        conn = sqlite3.connect(str(path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT key_id, api_key FROM pool_keys "
+            "WHERE provider_id = ? AND enabled = 1 ORDER BY id",
+            (provider_id,)
+        ).fetchall()
+        conn.close()
+        return [{"id": r["key_id"], "api_key": r["api_key"]} for r in rows]
+    except Exception as exc:
+        _log.warning(
+            f"[pool.config_parser] Failed to load keys from '{db_path}' "
+            f"for provider '{provider_id}': {exc}. Treating as 0 keys."
+        )
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +195,7 @@ def _resolve_thinking(provider_defaults: dict, model_override: dict | None) -> T
 def parse_pool_entries(
     raw_pool: dict,
     cooldowns_path: str = "scratchpad/cooldowns.json",
+    keys_db_path: str = "scratchpad/keys.db",
 ) -> tuple[list[PoolEntry], dict]:
     """
     Parse model_pool section of config.json into flat PoolEntry objects.
@@ -161,6 +203,9 @@ def parse_pool_entries(
     Args:
         raw_pool:       The dict at config["model_pool"].
         cooldowns_path: Path to the separate cooldowns.json runtime state file.
+        keys_db_path:   Path to the SQLite keys.db file. Keys for each provider
+                        are loaded from here unless the provider still has a
+                        'keys' array in config.json (backward-compat mode).
 
     Returns:
         (entries, pool_settings_raw)
@@ -174,7 +219,7 @@ def parse_pool_entries(
     cooldowns = load_cooldowns(cooldowns_path)
 
     if "providers" in raw_pool:
-        entries = _parse_providers(raw_pool["providers"], global_safety, cooldowns)
+        entries = _parse_providers(raw_pool["providers"], global_safety, cooldowns, keys_db_path)
     else:
         entries = []
         _log.warning("[pool.config_parser] model_pool has no 'providers' list — pool is empty.")
@@ -186,13 +231,18 @@ def parse_pool_entries(
 # Provider / model / keys hierarchy parser
 # ---------------------------------------------------------------------------
 
-def _parse_providers(providers_raw: list, global_safety: int, cooldowns: dict) -> list[PoolEntry]:
+def _parse_providers(
+    providers_raw: list,
+    global_safety: int,
+    cooldowns: dict,
+    keys_db_path: str = "scratchpad/keys.db",
+) -> list[PoolEntry]:
     entries: list[PoolEntry] = []
 
     for pi, prov in enumerate(providers_raw):
         pprefix = f"model_pool.providers[{pi}]"
 
-        for req in ("id", "base_url", "keys"):
+        for req in ("id", "base_url"):
             if req not in prov:
                 raise ValueError(f"Missing required field: {pprefix}.{req}")
 
@@ -218,10 +268,41 @@ def _parse_providers(providers_raw: list, global_safety: int, cooldowns: dict) -
                     raise ValueError(f"Missing required field: {mprefix}.{req}")
             models_by_id[mdl["id"]] = mdl
 
-        # Provider-level default models (inherited by keys with no model_ref)
+        # Provider-level default models (inherited by all keys)
         provider_default_models: list[str] = prov.get("default_models", [])
 
-        for ki, key in enumerate(prov["keys"]):
+        # ── Key source: config.json (backward compat) OR keys.db ──────────
+        config_keys: list[dict] = prov.get("keys", [])
+        if config_keys:
+            # keys[] still present in config.json — use them but warn the user
+            _log.warning(
+                f"[pool] Provider '{provider_id}' has a 'keys' array in config.json "
+                f"({len(config_keys)} key(s)). Using config.json keys directly."
+            )
+            _log.warning(
+                f"[pool] To move keys to the database and stop this warning:"
+            )
+            _log.warning(
+                f"[pool]   1. python keys_db.py import --from config.json"
+            )
+            _log.warning(
+                f"[pool]   2. Remove the 'keys' array from provider '{provider_id}' in config.json"
+            )
+            _log.warning(
+                f"[pool]   3. Restart the proxy"
+            )
+            raw_keys = config_keys
+        else:
+            # Load from keys.db
+            raw_keys = load_keys_from_db(keys_db_path, provider_id)
+            if not raw_keys:
+                _log.warning(
+                    f"[pool.config_parser] Provider '{provider_id}' has no enabled keys "
+                    f"in keys.db — skipping provider."
+                )
+                continue
+
+        for ki, key in enumerate(raw_keys):
             kprefix = f"{pprefix}.keys[{ki}]"
 
             for req in ("id", "api_key"):

@@ -214,6 +214,7 @@ def main() -> None:
             pool_entries, _ = parse_pool_entries(
                 config.raw_model_pool,
                 cooldowns_path=config.pool_settings.cooldowns_file,
+                keys_db_path=config.pool_settings.keys_db,
             )
 
             picker = init_picker(

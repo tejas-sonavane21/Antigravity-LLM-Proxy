@@ -112,6 +112,9 @@ class PoolSettings:
     # Path to the separate runtime cooldown state file (never mixed into config.json).
     # Written by _persist_cooldown_state(); loaded at startup to restore cooldowns.
     cooldowns_file: str = "scratchpad/cooldowns.json"
+    # Path to the SQLite key database. Keys are loaded from here at startup
+    # when a provider has no 'keys' array in config.json.
+    keys_db: str = "scratchpad/keys.db"
 
     def __post_init__(self):
         if self.fallback_limits is None:
@@ -375,6 +378,7 @@ def _parse_config(raw: dict) -> AppConfig:
             flag_file=patcher_raw.get("flag_file"),  # threaded from patcher section
             keep_alive_timeout_minutes=int(ps.get("keep_alive_timeout_minutes", 10)),
             cooldowns_file=str(ps.get("cooldowns_file", "scratchpad/cooldowns.json")),
+            keys_db=str(ps.get("keys_db", "scratchpad/keys.db")),
         )
 
     return AppConfig(
