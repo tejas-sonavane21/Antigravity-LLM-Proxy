@@ -123,6 +123,24 @@ class PoolSettings:
 
 
 @dataclass
+class FeaturesConfig:
+    """
+    Optional feature toggles for clod.io-era band-aids that are dormant by
+    default. Lives at config.json `features`. Both default to a lean state, so a
+    config WITHOUT a "features" section runs without these extras and nothing
+    breaks; flip either to True to re-enable the behavior with zero code change.
+
+      strict_tool_contract: append the <tool_calling_contract> block to the
+                            pool/mapped-model system prompt (Changes F+G+H).
+      harmony_sanitizer:    run the Layer A harmony residue cleaner on provider
+                            output (Change I). A no-op on clean providers, but
+                            gated here for peace of mind / future leaky hosts.
+    """
+    strict_tool_contract: bool = False
+    harmony_sanitizer: bool = False
+
+
+@dataclass
 class AppConfig:
     proxy: ProxyConfig
     upstream: UpstreamConfig
@@ -130,6 +148,7 @@ class AppConfig:
     providers: list         # list[ProviderConfig] — kept for backward compat
     patcher: PatcherConfig
     pool_settings: PoolSettings | None = None  # None = no pool configured
+    features: FeaturesConfig = field(default_factory=FeaturesConfig)
     # list[PoolEntry] is NOT stored here; it lives in PoolPicker after startup
     # The raw model_pool dict is stored separately so PoolPicker can write back
     # cooldown state changes to the correct location in config.json.
@@ -149,6 +168,10 @@ _TEMPLATE = {
         "dump_model_responses": False,
         "dump_requests": False,   # set True to print every intercepted request body
         "dump_pool_io": False,    # set True to print what we send/receive from pool providers
+    },
+    "features": {
+        "strict_tool_contract": False,  # F+G+H: inject <tool_calling_contract> into pool system prompt
+        "harmony_sanitizer": False,     # I: run Layer A harmony residue cleaner on provider output
     },
     "upstream": {
         "hosts": [
@@ -384,6 +407,15 @@ def _parse_config(raw: dict) -> AppConfig:
             keys_db=str(ps.get("keys_db", "scratchpad/keys.db")),
         )
 
+    # --- features (optional) ---
+    features_raw = raw.get("features", {})
+    if not isinstance(features_raw, dict):
+        features_raw = {}
+    features = FeaturesConfig(
+        strict_tool_contract=bool(features_raw.get("strict_tool_contract", False)),
+        harmony_sanitizer=bool(features_raw.get("harmony_sanitizer", False)),
+    )
+
     return AppConfig(
         proxy=proxy,
         upstream=upstream,
@@ -392,6 +424,7 @@ def _parse_config(raw: dict) -> AppConfig:
         patcher=patcher,
         pool_settings=pool_settings,
         raw_model_pool=raw_model_pool,
+        features=features,
     )
 
 

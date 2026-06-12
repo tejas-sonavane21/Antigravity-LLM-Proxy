@@ -58,19 +58,43 @@ _MAX_POOL_ATTEMPTS = 6  # legacy default — overridden at runtime by pool size
 # Activated by config.json -> proxy.dump_pool_io = true
 _dump_pool_io: bool = False
 
+# ---------------------------------------------------------------------------
+# Optional feature flags  (set at startup via configure(); fed from config.json
+# -> "features"). Both default to the lean/disabled-friendly state so a missing
+# "features" section never forces the clod.io-era band-aids on.
+#   _inject_strict_instructions -> Changes F+G+H: append the strict
+#       <tool_calling_contract> block to the pool/mapped-model system prompt.
+#   (the harmony sanitizer flag lives in openai_compat; we only propagate it.)
+# ---------------------------------------------------------------------------
+_inject_strict_instructions: bool = False
 
-def configure(*, dump_pool_io: bool = False) -> None:
+
+def configure(
+    *,
+    dump_pool_io: bool = False,
+    inject_strict_instructions: bool = False,
+    harmony_sanitizer: bool = True,
+) -> None:
     """Apply runtime configuration. Call once at startup (main.py)."""
-    global _dump_pool_io
+    global _dump_pool_io, _inject_strict_instructions
     _dump_pool_io = dump_pool_io
-    # Also set the flag in openai_compat so _iter_stream_events logs raw incoming chunks
+    _inject_strict_instructions = inject_strict_instructions
+    # Also set the flags in openai_compat so _iter_stream_events logs raw
+    # incoming chunks AND the Layer A harmony sanitizer honors its feature flag.
     import src.provider.openai_compat as _compat
     _compat._dump_pool_io = dump_pool_io
+    _compat._harmony_sanitize_enabled = harmony_sanitizer
     if dump_pool_io:
         _log.info(
             "[pool.handler] Pool I/O dumping ENABLED (dump_pool_io=true) "
             "-- outgoing OpenAI body + raw provider SSE will be printed"
         )
+    _log.info(
+        "[pool.handler] Feature flags -> strict_tool_contract=%s, "
+        "harmony_sanitizer=%s",
+        inject_strict_instructions,
+        harmony_sanitizer,
+    )
 
 
 _SEP = "=" * 72
@@ -144,14 +168,22 @@ def _inject_thinking(openai_body: dict, entry: PoolEntry) -> dict:
     Add provider-specific thinking/chain-of-thought parameters to the OpenAI
     request body based on the pool entry's ThinkingConfig.
 
-    Handles two provider conventions:
-      - OpenCode (OpenAI-compat): thinking={...} / thinking_budget=N
-      - SiliconFlow: enable_thinking=True/False, thinking_budget=N
+    The `budget` value is forwarded to `budget_param` with its NATIVE JSON type
+    and is intentionally NOT bound to any particular param name:
 
-    The exact field names are driven by entry.thinking.enable_param and
-    entry.thinking.budget_param, so adding a new provider is just config.
+      - numeric budget (e.g. thinking_budget = 8192)       -> sent as a number
+      - string  budget (e.g. reasoning_effort = "medium")  -> sent as a string
+
+    Whether budget_param is "thinking_budget", "reasoning_effort", or anything
+    else, we send exactly what the user configured. The user is responsible for
+    setting a value their provider understands (a token count, or a level such
+    as "low"/"medium"/"high"). This keeps provider onboarding config-only with
+    no per-param conversion logic.
+
+    Field names are driven by entry.thinking.enable_param / budget_param.
     """
     t = entry.thinking
+
     if not t.enabled:
         openai_body[t.enable_param] = False
         _log.debug(
@@ -163,10 +195,11 @@ def _inject_thinking(openai_body: dict, entry: PoolEntry) -> dict:
     openai_body[t.enable_param] = True
 
     if t.budget is not None:
+        # Pass the budget through with its native type (number OR string).
         openai_body[t.budget_param] = t.budget
         _log.debug(
             f"  [thinking] ENABLED for [{entry.id}] "
-            f"({t.enable_param}=True, {t.budget_param}={t.budget})"
+            f"({t.enable_param}=True, {t.budget_param}={t.budget!r})"
         )
     else:
         _log.debug(
@@ -507,8 +540,17 @@ async def handle_pool_request(
             picker.pending_advance = True
 
         # ── Convert Gemini -> OpenAI ──────────────────────────────────────
+        # Strict tool-call contract injection (Changes F+G+H) is now gated by
+        # the `features.strict_tool_contract` flag, threaded in via configure().
+        # When the flag is False the converter appends nothing; passthrough
+        # requests never reach this handler, so they are unaffected either way.
         try:
-            openai_body = convert_request(body, entry.model, include_thoughts)
+            openai_body = convert_request(
+                body,
+                entry.model,
+                include_thoughts,
+                inject_strict_instructions=_inject_strict_instructions,
+            )
         except ValueError as exc:
             _log.error(f"[POOL] Request conversion failed: {exc}")
             picker.release(entry.id, 400, None)
@@ -526,7 +568,10 @@ async def handle_pool_request(
             yield f"data: {err_event}\n\n".encode("utf-8")
             return
 
-        openai_body["stream"] = True
+        # Bug 1 fix: the request 'stream' flag MUST match how we parse the
+        # response below (entry.streaming). Hard-coding stream=True while the
+        # pool entry is non-streaming produced an empty IDE response.
+        openai_body["stream"] = entry.streaming
         openai_body = _inject_thinking(openai_body, entry)
 
         # ── Dump outgoing body if pool I/O logging is enabled ─────────────
@@ -602,15 +647,30 @@ async def handle_pool_request(
                         permanent_error = True
                         break  # exit per-entry retry; outer loop picks next entry
 
-                    # Successful connection — stream with entry-specific thinking field
+                    # Successful connection — process the response.
+                    # Bug 1 fix: request flag (entry.streaming) and the response
+                    # parser MUST agree. SSE-parsing a non-streamed JSON body
+                    # yields 0 chunks → empty IDE response.
                     event_count = 0
-                    async for sse_bytes in compat._iter_stream_events(
-                        resp,
-                        entry.model,
-                        thinking_field=entry.response_thinking_field,
-                    ):
-                        event_count += 1
-                        yield sse_bytes
+                    if entry.streaming:
+                        # True SSE streaming → per-delta Gemini events (Layers A+B).
+                        async for sse_bytes in compat._iter_stream_events(
+                            resp,
+                            entry.model,
+                            thinking_field=entry.response_thinking_field,
+                        ):
+                            event_count += 1
+                            yield sse_bytes
+                    else:
+                        # Non-streaming → collect the single JSON body from the
+                        # already-open response and convert it to one Gemini SSE
+                        # frame (wires the response side so the toggle is real).
+                        async for sse_bytes in compat._collect_and_convert_response(
+                            resp,
+                            entry.model,
+                        ):
+                            event_count += 1
+                            yield sse_bytes
 
                     _log.info(
                         f"  [POOL] [{entry.id}] stream done: "

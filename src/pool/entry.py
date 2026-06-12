@@ -42,7 +42,13 @@ class ThinkingConfig:
     Required for any model that breaks on thinking+tool_use (e.g. DeepSeek-V3.1).
     """
     enabled: bool
-    budget: Optional[int]      # token budget for thinking; None = use provider default
+    # Thinking budget, passed through to budget_param with its NATIVE type:
+    #   - numeric token count (e.g. 8192) for thinking_budget-style providers, OR
+    #   - a string level (e.g. "low"/"medium"/"high") for reasoning_effort-style
+    #     providers.
+    # The data type is intentionally NOT bound to budget_param; the user sets a
+    # value their provider understands. None = use the provider default.
+    budget: Optional[int | str]
     enable_param: str           # request field name to enable/disable thinking
     budget_param: str           # request field name to set thinking budget
 

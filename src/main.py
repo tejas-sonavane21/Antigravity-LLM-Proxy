@@ -206,6 +206,8 @@ def main() -> None:
     from src.pool import handler as _handler_module
     _handler_module.configure(
         dump_pool_io=config.proxy.dump_pool_io,
+        inject_strict_instructions=config.features.strict_tool_contract,
+        harmony_sanitizer=config.features.harmony_sanitizer,
     )
 
     # --- Pool: Initialize PoolPicker ---

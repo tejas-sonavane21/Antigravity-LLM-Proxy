@@ -15,7 +15,9 @@ Design rules (from model_list_analysis.md Section 5):
 The patching is deliberately minimal:
   - maxTokens        -> pool_entry.usable_tokens  (context window visible to IDE)
   - supportsThinking -> True                       (all our pool models support thinking)
-  - thinkingBudget   -> entry.thinking.budget if set, else leave as-is
+  - thinkingBudget   -> entry.thinking.budget ONLY when numeric; string budgets
+                        (reasoning_effort levels) are skipped to keep the FAMS
+                        handshake well-formed (IDE expects an integer here)
 
 We do NOT patch:
   - maxOutputTokens  (we let the provider cap its own output naturally)
@@ -103,9 +105,18 @@ def patch_model_metadata(
     # and the model would reject it with a tool-call failure.
     target["supportsThinking"] = pool_entry.thinking.enabled
 
-    # thinkingBudget: use pool entry's configured budget if thinking is enabled
-    if pool_entry.thinking.enabled and pool_entry.thinking.budget is not None:
-        target["thinkingBudget"] = pool_entry.thinking.budget
+    # thinkingBudget: the IDE's fetchAvailableModels (FAMS) handshake expects an
+    # INTEGER token count here. Only patch it when the configured budget is
+    # numeric. A STRING budget (e.g. "medium" for a reasoning_effort provider)
+    # must NEVER be written here — a string value makes the IDE reject the model
+    # metadata with "There was an error with your authentication". For string
+    # budgets we leave Google's default thinkingBudget untouched (it is
+    # irrelevant to reasoning_effort providers, which drive thinking via
+    # thinkingLevel / reasoning_effort rather than a numeric budget).
+    if pool_entry.thinking.enabled and isinstance(
+        pool_entry.thinking.budget, (int, float)
+    ):
+        target["thinkingBudget"] = int(pool_entry.thinking.budget)
 
     # maxOutputTokens: patch only when the entry has an explicit value configured.
     # When None (most entries), leave Google's value untouched — the provider

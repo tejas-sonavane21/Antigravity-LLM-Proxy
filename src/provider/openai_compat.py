@@ -46,6 +46,7 @@ Retry logic (proxy.rs L1467-L1537):
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -102,6 +103,17 @@ _FINISH_REASON_MAP = {
 _dump_pool_io: bool = False
 
 # ---------------------------------------------------------------------------
+# Harmony sanitizer feature flag  (Change I — set at startup via
+# pool.handler.configure(), fed from config.json -> features.harmony_sanitizer).
+# When False, the Layer A harmony residue cleaner becomes a transparent NO-OP:
+#   • _HarmonySanitizer passes deltas through untouched (and never buffers a
+#     carry, so flush() stays empty);
+#   • _strip_harmony_full_block returns its input verbatim.
+# Default True so the unit tests (which never call configure()) exercise the
+# real cleaner. Flipping it on/off requires zero code changes — config only.
+_harmony_sanitize_enabled: bool = True
+
+# ---------------------------------------------------------------------------
 # Heartbeat / keepalive
 # ---------------------------------------------------------------------------
 # SSE spec §9.2: lines beginning with ':' are comments and MUST be ignored.
@@ -124,6 +136,251 @@ class _ToolCallAcc:
     call_id:   str = ""
     name:      str = ""
     args_json: str = ""   # JSON string, built up fragment by fragment
+
+
+# ---------------------------------------------------------------------------
+# Layer A — Harmony residue sanitizer
+# ---------------------------------------------------------------------------
+# Some providers (e.g. clod.io serving gpt-oss) ship an INCOMPLETE server-side
+# OpenAI-"harmony" parser. They strip the <|...|> control tokens but leak the
+# channel/role header WORDS (assistant / analysis / commentary / final) and the
+# raw tool-call syntax ("commentary to=functions.<name> json{...}") straight
+# into the `content` (and sometimes `reasoning`) delta fields. Those leaked
+# words then surface in the IDE as garbled text.
+#
+# `_HarmonySanitizer` is a small, idempotent, STREAMING-SAFE cleaner:
+#   • removes complete <|...|> tokens and any header words glued to them;
+#   • holds back a tiny tail that could be the start of a split <|...|> token
+#     (e.g. "<|chan") so a token spanning two deltas is still removed;
+#   • drops leaked "to=functions.<name> json" tool-call headers;
+#   • strips a leading harmony role header ("assistant"/"assistantfinal"/...)
+#     that survived token-stripping, only at the very start of the visible text.
+#
+# It is designed to NO-OP on clean providers: every rule requires an actual
+# harmony marker (a <|...|> token, a leading "assistant" role word, or the
+# literal "to=functions." syntax), so ordinary prose like "the final answer"
+# or "finalize the report" passes through untouched.
+
+# Lowercase harmony channel names, exactly as clod's partial parser leaks them.
+# Matched case-SENSITIVELY everywhere below: capitalised prose ("Final answer",
+# "Analysis:") and space-separated words are legitimate text, never stripped.
+_HARMONY_CH = r"analysis|commentary|final"
+
+# A cluster of one-or-more <|...|> tokens, optionally surrounded by glued
+# channel/role words. The (?:<\|[^|]*\|>\s*)+ part is REQUIRED, so this never
+# matches plain text that merely contains the word "final"/"analysis".
+_HARMONY_CHANNEL_BLOCK_RE = re.compile(
+    r"(?:(?:assistant|analysis|commentary|final)\s*)*"
+    r"(?:<\|[^|]*\|>\s*)+"
+    r"(?:(?:assistant|analysis|commentary|final)\s*)*",
+    re.IGNORECASE,
+)
+
+# Trailing fragment that could be the BEGINNING of a split <|...|> token:
+# matches a lone "<" or "<|" or "<|chan" at end of buffer (never a closed token).
+_HARMONY_PARTIAL_TOKEN_RE = re.compile(r"<(?:\|[^|>]*)?$")
+
+# (G) Role-anchored channel switch in its GLUED leaked form. Anchored on the
+#     literal lowercase role word "assistant" + a REQUIRED channel word, so
+#     ordinary prose containing "assistant" (always space-separated) is never
+#     touched. Removes: "assistantanalysis", "assistantfinal",
+#     "assistantcommentary to=functions.view_file json".
+_HARMONY_SWITCH_RE = re.compile(
+    r"assistant(?:" + _HARMONY_CH + r")"
+    r"(?:[ \t]*to=functions\.[A-Za-z0-9_.\-]+)?"
+    r"(?:[ \t]*json)?"
+)
+
+# (T) A leaked tool-call header, e.g. "commentary to=functions.write_file json"
+#     or just "to=functions.foo". The literal "to=functions." is unambiguous
+#     harmony syntax, safe to strip anywhere.
+_HARMONY_TOOLHEADER_RE = re.compile(
+    r"(?:assistant[ \t]*)?(?:commentary[ \t]*)?to=functions\.[A-Za-z0-9_.\-]+"
+    r"(?:[ \t]*json)?",
+    re.IGNORECASE,
+)
+
+# (B) Bare channel switch (parser dropped the role word) in GLUED form: the
+#     channel word "analysis"/"commentary" immediately followed by an UPPERCASE
+#     letter (harmony glues a channel to the next capitalised sentence, e.g.
+#     "analysisThe user wants..."). We require an UPPERCASE letter (a following
+#     space/lowercase = prose) and EXCLUDE "final" (a common code keyword such
+#     as `final{`); the final channel only appears in the safe "assistant"-
+#     prefixed or leading forms.
+_HARMONY_BARE_SWITCH_RE = re.compile(r"(?:analysis|commentary)(?=[A-Z])")
+
+# (L) A harmony header at the very START of a channel's visible text. Two safe
+#     forms only: (1) the lowercase role word "assistant" (+ glued channel
+#     words) — a model never legitimately opens a reply with "assistant"; or
+#     (2) one-or-more glued channel words IMMEDIATELY followed by an UPPERCASE
+#     letter. A channel word followed by a space ("analysis shows") or lowercase
+#     ("finalize", "finally") is treated as prose and preserved.
+_HARMONY_LEAD_RE = re.compile(
+    r"^[ \t]*"
+    r"(?:"
+    r"assistant(?:" + _HARMONY_CH + r")*"
+    r"|(?:" + _HARMONY_CH + r")+(?=[A-Z])"
+    r")"
+)
+
+# Harmony header forms whose IMMEDIATELY-following {..}/".." blob is an
+# unambiguous leaked tool-call payload (args) or hallucinated tool result. Each
+# alternative is anchored on real harmony syntax (role word "assistant" with a
+# channel, or the "to=functions." literal), so a bare code keyword such as
+# `final{` is NEVER matched and prose/code JSON is preserved.
+_HARMONY_PAYLOAD_HEADER_RE = re.compile(
+    r"assistant(?:" + _HARMONY_CH + r")"
+    r"(?:[ \t]*to=functions\.[A-Za-z0-9_.\-]+)?(?:[ \t]*json)?"
+    r"|(?:assistant[ \t]*)?(?:commentary[ \t]*)?to=functions\.[A-Za-z0-9_.\-]+"
+    r"(?:[ \t]*json)?"
+)
+
+
+def _harmony_balanced_end(text: str, start: int) -> int | None:
+    """
+    text[start] must be '{' or '"'. Return the index just past the balanced
+    JSON object / quoted string, or None if it never closes (then DON'T strip).
+    """
+    ch = text[start]
+    if ch == "{":
+        depth = 0
+        in_str = False
+        esc = False
+        i = start
+        while i < len(text):
+            c = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            else:
+                if c == '"':
+                    in_str = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return i + 1
+            i += 1
+        return None
+    if ch == '"':
+        i = start + 1
+        esc = False
+        while i < len(text):
+            c = text[i]
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                return i + 1
+            i += 1
+        return None
+    return None
+
+
+def _strip_harmony_full_block(text: str) -> str:
+    """
+    Non-streaming ONLY (whole text available): remove harmony header markers AND
+    the leaked tool/commentary payload ({..} or "..") that is GLUED to a harmony
+    header. Conservative — a balanced payload is removed only when it directly
+    follows a header, so legitimate JSON elsewhere in prose/code survives.
+    """
+    if not _harmony_sanitize_enabled:
+        return text
+    out: list[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        m = _HARMONY_PAYLOAD_HEADER_RE.search(text, pos)
+        if not m:
+            out.append(text[pos:])
+            break
+        out.append(text[pos:m.start()])  # keep text before the header
+        # drop the header itself; strip a glued balanced payload if present
+        j = m.end()
+        while j < n and text[j] in " \t\r\n":
+            j += 1
+        if j < n and text[j] in '{"':
+            be = _harmony_balanced_end(text, j)
+            if be is not None:
+                pos = be
+                continue
+        pos = m.end()
+    return "".join(out)
+
+
+class _HarmonySanitizer:
+    """
+    Stateful, streaming-safe sanitizer for one logical text channel
+    (content OR reasoning). Use a SEPARATE instance per channel so their
+    carry buffers never cross-contaminate.
+    """
+
+    # Max chars held back while waiting for a split <|...|> token to complete.
+    _MAX_CARRY = 64
+
+    def __init__(self, enabled: "bool | None" = None) -> None:
+        # enabled=None -> read the module-level feature flag at construction
+        # time (the normal runtime path). Passing an explicit bool overrides it
+        # (used by unit tests). When disabled this sanitizer is a transparent
+        # pass-through and never buffers a carry, so flush() stays empty too.
+        self._enabled: bool = (
+            _harmony_sanitize_enabled if enabled is None else enabled
+        )
+        self._carry: str = ""
+        self._seen_visible: bool = False  # has any real content been emitted yet?
+
+    def _strip_tokens(self, delta: str) -> str:
+        """Remove <|...|> token clusters; carry back a possible split token."""
+        text = self._carry + delta
+        self._carry = ""
+        text = _HARMONY_CHANNEL_BLOCK_RE.sub("", text)
+        m = _HARMONY_PARTIAL_TOKEN_RE.search(text)
+        if m and (len(text) - m.start()) <= self._MAX_CARRY:
+            self._carry = text[m.start():]
+            text = text[: m.start()]
+        return text
+
+    @staticmethod
+    def _strip_markers(text: str) -> str:
+        """Remove glued, token-free harmony role/channel/tool-header markers."""
+        text = _HARMONY_SWITCH_RE.sub("", text)
+        text = _HARMONY_TOOLHEADER_RE.sub("", text)
+        text = _HARMONY_BARE_SWITCH_RE.sub("", text)
+        return text
+
+    def _clean(self, delta: str) -> str:
+        """Shared cleaner for both the content and reasoning channels."""
+        if not self._enabled:
+            # Feature flag off: forward the provider's text unchanged.
+            return delta
+        text = self._strip_tokens(delta)
+        if not text:
+            return ""
+        text = self._strip_markers(text)
+        if not self._seen_visible:
+            text = _HARMONY_LEAD_RE.sub("", text, count=1)
+        if text.strip():
+            self._seen_visible = True
+        return text
+
+    def process_content(self, delta: str) -> str:
+        """Clean a delta destined for the VISIBLE content channel."""
+        return self._clean(delta)
+
+    def process_reasoning(self, delta: str) -> str:
+        """Clean a delta destined for the THOUGHT/reasoning channel."""
+        return self._clean(delta)
+
+    def flush(self) -> str:
+        """Return any held-back carry at end of stream (it was real text)."""
+        out, self._carry = self._carry, ""
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +724,19 @@ class OpenAICompatProvider:
         chunk_num = 0
         heartbeat_count = 0
 
+        # ── Layer A — per-channel harmony sanitizers (separate carry buffers) ──
+        content_sanitizer = _HarmonySanitizer()
+        reasoning_sanitizer = _HarmonySanitizer()
+
+        # ── Layer B — trustworthy tool-call batch tracking ────────────
+        # We now TRUST the provider's structured tool_calls. gpt-oss harmony
+        # legitimately interleaves analysis -> tool call -> analysis -> tool
+        # call -> final; the provider already separates reasoning, content and
+        # structured tool_calls for us, so EVERY tool call it emits is forwarded
+        # in arrival order. Hallucinated-result behaviour is addressed upstream
+        # via the strict system-prompt contract, never by dropping live calls.
+        tool_order: list[int] = []  # tool-call indices in first-seen order
+
         import time as _time
         _last_keepalive_t = _time.monotonic()
 
@@ -603,27 +873,43 @@ class OpenAICompatProvider:
                         ""
                     )
                 if reasoning_delta:
-                    self._log.debug(
-                        f"  chunk#{chunk_num}: thought +{len(reasoning_delta)}ch"
-                    )
-                    yield _partial_text_event(reasoning_delta, thought=True)
-                    _last_keepalive_t = _time.monotonic()  # reset — just yielded
+                    # Always forward genuine reasoning as a thought (Layer A
+                    # cleaned). Interleaved reasoning between tool calls is
+                    # normal harmony behaviour, NOT contamination.
+                    clean_reason = reasoning_sanitizer.process_reasoning(
+                        reasoning_delta
+                    )  # Layer A
+                    if clean_reason:
+                        self._log.debug(
+                            f"  chunk#{chunk_num}: thought +{len(clean_reason)}ch"
+                        )
+                        yield _partial_text_event(clean_reason, thought=True)
+                        _last_keepalive_t = _time.monotonic()  # reset — just yielded
 
                 # ── Text content ──────────────────────────────────────
                 content_delta = delta.get("content") or ""
                 if content_delta:
-                    self._log.debug(
-                        f"  chunk#{chunk_num}: text +{len(content_delta)}ch"
-                    )
-                    yield _partial_text_event(content_delta, thought=False)
-                    _last_keepalive_t = _time.monotonic()  # reset — just yielded
+                    # Always forward visible content (Layer A cleaned). We no
+                    # longer suppress content that appears after a tool call.
+                    clean_content = content_sanitizer.process_content(
+                        content_delta
+                    )  # Layer A
+                    if clean_content:
+                        self._log.debug(
+                            f"  chunk#{chunk_num}: text +{len(clean_content)}ch"
+                        )
+                        yield _partial_text_event(clean_content, thought=False)
+                        _last_keepalive_t = _time.monotonic()  # reset — just yielded
 
-                # ── Tool call deltas — accumulate ─────────────────────
+                # ── Tool call deltas — accumulate (Layer B aware) ─────
                 for tc_delta in delta.get("tool_calls", []):
                     idx = tc_delta.get("index", 0)
                     has_tool_calls = True
                     if idx not in tool_accs:
+                        # A brand-new tool-call index begins here. Record arrival
+                        # order; every call is forwarded — nothing is discarded.
                         tool_accs[idx] = _ToolCallAcc(index=idx)
+                        tool_order.append(idx)
                     acc = tool_accs[idx]
                     if tc_delta.get("id"):
                         acc.call_id = tc_delta["id"]
@@ -638,7 +924,7 @@ class OpenAICompatProvider:
                     args_len = sum(len(a.args_json) for a in tool_accs.values())
                     self._log.debug(
                         f"  chunk#{chunk_num}: accumulating tool_call "
-                        f"{names} | args={args_len}ch so far"
+                        f"{names} | order={tool_order} args={args_len}ch"
                     )
 
         finally:
@@ -648,23 +934,50 @@ class OpenAICompatProvider:
             if not _reader_task.done():
                 _reader_task.cancel()
 
+        # ── Layer A flush: emit any held-back sanitizer tail ──────────────
+        # Always flush now — there is no contaminated-turn suppression anymore.
+        tail = content_sanitizer.flush()
+        if tail.strip():
+            yield _partial_text_event(tail, thought=False)
+        reason_tail = reasoning_sanitizer.flush()
+        if reason_tail.strip():
+            yield _partial_text_event(reason_tail, thought=True)
+
         # ── End of stream: yield terminal event ───────────────────────
         if heartbeat_count:
             self._log.info(
                 f"  [{self._provider.name}] {heartbeat_count} keepalive(s) "
                 f"sent during stream"
             )
-        if has_tool_calls and tool_accs:
-            tool_list = sorted(tool_accs.values(), key=lambda x: x.index)
+
+        # Forward EVERY structured tool call the provider emitted, in arrival
+        # order (Layer B discard logic removed — see note at init above).
+        all_tool_calls = [
+            tool_accs[i] for i in tool_order
+            if i in tool_accs and tool_accs[i].name
+        ]
+
+        if all_tool_calls:
+            # NOTE (§11.2): finish_reason is NOT trusted as the sole signal —
+            # gpt-oss + an imperfect harness sometimes mislabels a tool-call
+            # turn as 'stop'. Whenever a tool call exists we emit a tool-call
+            # event and force finishReason via 'tool_calls'.
             self._log.info(
                 f"  [{self._provider.name}] Tool calls complete: "
-                f"{[t.name for t in tool_list]} → IDE"
+                f"{[t.name for t in all_tool_calls]} → IDE"
             )
-            yield _tool_call_event(tool_list, finish_reason, last_model, last_usage)
+            yield _tool_call_event(all_tool_calls, "tool_calls", last_model, last_usage)
             # Give the IOCP transport one event-loop cycle to flush the
             # tool_call bytes before uvicorn sends the connection-close signal.
             await asyncio.sleep(0.15)
         else:
+            if has_tool_calls:
+                # Tool-call deltas were seen but none had a parseable name —
+                # emit a clean STOP so the IDE still gets a well-formed event.
+                self._log.warning(
+                    f"  [{self._provider.name}] tool_calls present but no "
+                    f"parseable name — emitting STOP"
+                )
             self._log.info(
                 f"  [{self._provider.name}] Text turn complete "
                 f"({chunk_num} chunks) → IDE"
@@ -843,6 +1156,130 @@ class OpenAICompatProvider:
 
         self._log.info(
             f"  [{self._provider.name}] SSE ready: {len(sse_body)} chars → IDE"
+        )
+        yield sse_body.encode("utf-8")
+
+    # ------------------------------------------------------------------
+    # Path B (pool variant): convert an ALREADY-OPEN non-streamed response
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sanitize_text_block(text: str, *, is_content: bool) -> str:
+        """Layer A applied to a COMPLETE (non-streamed) text block."""
+        if not isinstance(text, str) or not text:
+            return text
+        # Full text available -> also strip header-glued tool/commentary payloads
+        # ({..} / "..") that the streaming sanitizer cannot balance incrementally.
+        text = _strip_harmony_full_block(text)
+        san = _HarmonySanitizer()
+        out = san.process_content(text) if is_content else san.process_reasoning(text)
+        out += san.flush()
+        return out
+
+    def _sanitize_response_dict(self, openai_resp: dict) -> None:
+        """In-place Layer A cleanup of a parsed non-streaming OpenAI response."""
+        choices = openai_resp.get("choices")
+        if not isinstance(choices, list):
+            return
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            msg = choice.get("message")
+            if not isinstance(msg, dict):
+                continue
+            if isinstance(msg.get("content"), str):
+                msg["content"] = self._sanitize_text_block(
+                    msg["content"], is_content=True
+                )
+            for rk in ("reasoning", "thinking_content"):
+                if isinstance(msg.get(rk), str):
+                    msg[rk] = self._sanitize_text_block(msg[rk], is_content=False)
+
+    async def _collect_and_convert_response(
+        self,
+        resp: "httpx.Response",
+        target_model: str,
+    ) -> AsyncIterator[bytes]:
+        """
+        Collect the body of an ALREADY-OPEN, non-streamed provider response
+        (opened by the pool handler via client.stream(...)), convert it to a
+        single Gemini SSE frame, and yield it.
+
+        This is the response-side counterpart to the Bug 1 request-flag fix:
+        when entry.streaming is False the request is sent with stream=False,
+        so the body is one JSON blob — it must NOT be parsed as SSE.
+
+        Body collection is keepalive-aware (mirrors _collect_from_provider):
+        a non-streaming provider only sends the body after it finishes
+        generating, which can take minutes, so we inject SSE comments while
+        waiting to keep the IDE connection alive.
+        """
+        _body_chunks: list[bytes] = []
+        _hb = 0
+        _body_aiter = resp.aiter_bytes(chunk_size=65536).__aiter__()
+        while True:
+            try:
+                _chunk = await asyncio.wait_for(
+                    _body_aiter.__anext__(),
+                    timeout=_HEARTBEAT_INTERVAL,
+                )
+                _body_chunks.append(_chunk)
+            except asyncio.TimeoutError:
+                _hb += 1
+                self._log.debug(
+                    f"  [{self._provider.name}] collect keepalive #{_hb} "
+                    f"(provider still generating...)"
+                )
+                yield _SSE_KEEPALIVE
+            except StopAsyncIteration:
+                break
+
+        resp_bytes = b"".join(_body_chunks)
+        if _hb:
+            self._log.info(
+                f"  [{self._provider.name}] {_hb} keepalive(s) sent while "
+                f"collecting {len(resp_bytes)}B response"
+            )
+
+        if not resp_bytes:
+            yield self._error_sse_bytes(502, "No response received from provider")
+            return
+
+        try:
+            openai_resp = json.loads(resp_bytes)
+        except Exception as exc:
+            raw_preview = resp_bytes.decode("utf-8", errors="replace")[:500]
+            self._log.error(
+                f"  [{self._provider.name}] JSON parse error: {exc} | "
+                f"raw: {raw_preview}"
+            )
+            yield self._error_sse_bytes(
+                502, f"Provider response not valid JSON: {exc}"
+            )
+            return
+
+        # Layer A: clean harmony residue from the non-streamed message too.
+        try:
+            self._sanitize_response_dict(openai_resp)
+        except Exception as exc:  # never let sanitization break the response
+            self._log.warning(
+                f"  [{self._provider.name}] harmony sanitize skipped: {exc}"
+            )
+
+        try:
+            sse_body = convert_response(openai_resp, target_model)
+        except Exception as exc:
+            self._log.error(
+                f"  [{self._provider.name}] Response conversion failed: {exc}"
+            )
+            yield self._error_sse_bytes(
+                502, f"Response conversion error: {exc}"
+            )
+            return
+
+        self._log.info(
+            f"  [{self._provider.name}] SSE ready (non-stream): "
+            f"{len(sse_body)} chars → IDE"
         )
         yield sse_body.encode("utf-8")
 
